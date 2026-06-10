@@ -124,6 +124,26 @@
   footer .wrap{display:flex;justify-content:space-between;gap:20px;flex-wrap:wrap;align-items:center;}
   footer a{color:var(--muted);}
   .disc{margin-top:14px;font-size:12.5px;color:#9a9c96;max-width:70ch;}
+
+  /* ── Tests ── */
+  .totbar{display:flex;align-items:baseline;gap:14px;margin:4px 0 28px;flex-wrap:wrap;}
+  .totbar .big{font-family:var(--mono);font-size:clamp(34px,5vw,44px);font-weight:800;color:var(--accent);line-height:1;}
+  .totbar .lab{color:var(--muted);font-size:15px;}
+  .totbar .lab b{color:var(--ink);}
+  .stat-row{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;}
+  @media(max-width:820px){.stat-row{grid-template-columns:1fr;}}
+  .stat{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px 20px;display:flex;flex-direction:column;gap:5px;}
+  .stat .n{font-family:var(--mono);font-size:26px;font-weight:700;color:var(--accent);line-height:1;}
+  .stat .n small{font-size:14px;color:var(--muted);font-weight:500;}
+  .stat .s{font-family:var(--mono);font-size:13px;color:var(--ink);font-weight:600;}
+  .stat .d{font-size:13px;color:var(--muted);line-height:1.45;}
+  .scenttl{margin:36px 0 14px;font-size:13px;font-family:var(--mono);letter-spacing:.06em;color:var(--muted);text-transform:uppercase;}
+  .scen{display:grid;gap:10px;}
+  .scen .row{display:grid;grid-template-columns:1fr 26px 230px;gap:12px;align-items:center;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:13px 18px;}
+  .scen .att{font-size:14.5px;color:var(--ink);}
+  .scen .arr{color:var(--muted);font-family:var(--mono);text-align:center;}
+  .scen .out{font-size:13px;color:var(--accent);font-family:var(--mono);font-weight:600;text-align:right;}
+  @media(max-width:680px){.scen .row{grid-template-columns:1fr;gap:4px;}.scen .out{text-align:left;}.scen .arr{display:none;}}
 </style>
 </head>
 <body>
@@ -135,6 +155,7 @@
       <a href="#problem" class="hide-sm">Problem</a>
       <a href="#how" class="hide-sm">How it works</a>
       <a href="#validators" class="hide-sm">Validators</a>
+      <a href="#tests" class="hide-sm">Tests</a>
       <a href="#start">Get started</a>
       <a class="btn btn-ghost" href="https://github.com/Jatwaa/antipsyc">GitHub</a>
     </div>
@@ -267,6 +288,38 @@
       <div class="feat"><span class="ic">🛈</span><div><h3>A conscience layer</h3><p>Auto-hooks for contradiction, sycophancy, scope-mismatch and calibration drift — plus intent tracking and chain-of-verification tools.</p></div></div>
       <div class="feat"><span class="ic">🔒</span><div><h3>Safe by default</h3><p>SSRF protection, path/root sandboxing, allowlisted process execution, ReDoS-guarded regex, and a production startup guard.</p></div></div>
     </div>
+  </div>
+</section>
+
+<!-- TESTS -->
+<section id="tests" class="alt">
+  <div class="wrap">
+    <p class="eyebrow">Verification &amp; results</p>
+    <h2>Tested against its own threat model</h2>
+    <p class="lead">Six suites run on every change — exercising every validator, the full MCP protocol, and the conscience layer. The interesting tests aren't the ones that confirm true claims; they're the ones that try to sneak a false claim past the gate.</p>
+    <div class="totbar"><span class="big">293</span><span class="lab"><b>checks · 100% passing</b> on the published build</span></div>
+    <div class="stat-row">
+      <div class="stat"><div class="n">95<small>/95</small></div><div class="s">deterministic salvo</div><div class="d">Every validator, templates &amp; the gate over the HTTP API — known-true and known-false claims with fixed expected outcomes.</div></div>
+      <div class="stat"><div class="n">128<small>/128</small></div><div class="s">conscience suite</div><div class="d">23 sections: gate, auto-hooks, intent tracking, chain-of-verification, consistency vote, and HALT enforcement.</div></div>
+      <div class="stat"><div class="n">35<small>/35</small></div><div class="s">MCP protocol</div><div class="d">Handshake, tool listing with annotations, and tool calls over real newline-delimited stdio framing.</div></div>
+      <div class="stat"><div class="n">23<small>/23</small></div><div class="s">codebase &amp; git</div><div class="d">Glob-scoped codebase search, the git-history validators, and claim deduplication by fingerprint.</div></div>
+      <div class="stat"><div class="n">7<small>/7</small></div><div class="s">adversarial regressions</div><div class="d">Replays of known bypasses — weak, unrelated, self-supplied, or policy-blocked evidence must not promote.</div></div>
+      <div class="stat"><div class="n">5<small>/5</small></div><div class="s">conscious-logic</div><div class="d">Bypasses that require reasoning about <em>promotion</em>, not merely running a validator.</div></div>
+    </div>
+
+    <p class="scenttl">Adversarial scenarios — attempt → outcome</p>
+    <div class="scen">
+      <div class="row"><span class="att">A model supplies its own "evidence" text to verify a real-world fact</span><span class="arr">→</span><span class="out">syntactic · rw ≤ 0.25</span></div>
+      <div class="row"><span class="att">Unrelated math used to "prove" a broad operational claim</span><span class="arr">→</span><span class="out">demoted · irrelevant</span></div>
+      <div class="row"><span class="att">A high realityWeight claim that evidence <em>contradicted</em></span><span class="arr">→</span><span class="out">gate · suppress</span></div>
+      <div class="row"><span class="att">A claim padded with clauses the validator cannot speak to</span><span class="arr">→</span><span class="out">contract · rejected</span></div>
+      <div class="row"><span class="att">A fabricated realityWeight handed straight to the gate</span><span class="arr">→</span><span class="out">unattested · suppress</span></div>
+      <div class="row"><span class="att">Reading a file outside the configured allowed roots</span><span class="arr">→</span><span class="out">blocked</span></div>
+      <div class="row"><span class="att">An HTTP probe to loopback or a private IP (SSRF)</span><span class="arr">→</span><span class="out">blocked</span></div>
+      <div class="row"><span class="att">A public URL that redirects to a private address</span><span class="arr">→</span><span class="out">blocked at the hop</span></div>
+      <div class="row"><span class="att">An interaction chain asserting a physical event with no causal schema</span><span class="arr">→</span><span class="out">cannot verify</span></div>
+    </div>
+    <p class="lead" style="margin-top:22px;margin-bottom:0;">Run them yourself: <code>node test-deterministic-salvo.mjs</code>, <code>node test-conscience-full.mjs</code>, <code>node test-v5-adversarial.mjs</code>, <code>node test-v6-conscious-logic.mjs</code>.</p>
   </div>
 </section>
 

@@ -229,8 +229,8 @@ async function run() {
   // ════════════════════════════════════════════════════════════════════════
   hdr("F · git history validators");
 
-  ev = await verify({ statement: "recent commit mentions feat:", validator: "git.log_contains", message: "feat:" });
-  assert("F1  [TRUE]  'feat:' in recent commits → VERIFIED",            ev.verified === true);
+  ev = await verify({ statement: "recent commit mentions AntiPsyc", validator: "git.log_contains", message: "AntiPsyc" });
+  assert("F1  [TRUE]  'AntiPsyc' in recent commits → VERIFIED",         ev.verified === true);
   note(`  searched ${ev.result?.commitsSearched} commit(s)`);
 
   ev = await verify({ statement: "recent commit mentions React framework", validator: "git.log_contains", message: "React framework" });
