@@ -1,0 +1,24 @@
+{
+  "name": "antipsyc",
+  "version": "0.7.0",
+  "description": "AntiPsyc — universal anti-hallucination validation MCP server with a searchable evidence UI.",
+  "type": "module",
+  "bin": {
+    "antipsyc": "./src/server.js"
+  },
+  "scripts": {
+    "start": "node ./src/server.js --http --mcp",
+    "mcp":   "node ./src/server.js --mcp",
+    "ui":    "node ./src/server.js --http",
+    "demo":  "node ./src/server.js --demo",
+    "smoke": "node ./src/server.js --smoke",
+    "test:conscience": "node ./test-conscience-full.mjs",
+    "test:model":     "node ./test-model-subject.mjs",
+    "test:v5": "node ./test-v5-adversarial.mjs",
+    "test:v6": "node ./test-v6-conscious-logic.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "license": "MIT"
+}

@@ -1,0 +1,19 @@
+data/
+node_modules/
+.env
+*.log
+
+# Local editor / harness config (machine-specific paths)
+.claude/
+
+# Internal review, audit, and planning docs — not for the public repo
+REVIEW.md
+ROADMAP.md
+ImplementationPlan_v3.md
+ImplementationPlan_v4.md
+docs/improvement-review.md
+docs/adversarial-test-report.md
+docs/hallucination-test-report.md
+docs/v5-hardening-report.md
+docs/v6-conscious-logic-report.md
+docs/epistemic-validation-layer.md

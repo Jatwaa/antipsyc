@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>AntiPsyc</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <main class="shell">
+      <section class="toolbar" aria-label="Evidence controls">
+        <div class="title-block">
+          <h1>
+            AntiPsyc
+            <span id="version-badge" class="version-badge" title="View changelog">v…</span>
+          </h1>
+          <p>Claims remain provisional until tools produce evidence.</p>
+        </div>
+        <div class="toolbar-actions">
+          <button id="changelog-btn" class="ghost-btn" type="button" aria-haspopup="dialog">Changelog</button>
+          <label class="search">
+            <span>Search</span>
+            <input id="search" type="search" placeholder="status, validator, statement…">
+          </label>
+        </div>
+      </section>
+
+      <section class="composer" aria-label="Create validation">
+        <form id="claim-form">
+          <input name="statement" placeholder="Claim to verify" required>
+          <select id="validator-select" name="validator">
+            <optgroup label="Filesystem">
+              <option value="filesystem.exists">File exists</option>
+              <option value="filesystem.stat">File stat</option>
+              <option value="file.contains">File contains text</option>
+              <option value="file.matches">File matches regex</option>
+            </optgroup>
+            <optgroup label="Code &amp; Process">
+              <option value="code.run">Code runs correctly</option>
+              <option value="process.run">Process exits cleanly</option>
+            </optgroup>
+            <optgroup label="Codebase">
+              <option value="codebase.contains">Codebase contains (glob)</option>
+            </optgroup>
+            <optgroup label="Git">
+              <option value="git.file_exists">Git file exists</option>
+              <option value="git.contains">Git file contains</option>
+              <option value="git.branch_exists">Git branch exists</option>
+              <option value="git.log_contains">Git log contains</option>
+              <option value="git.last_modified">Git last modified</option>
+              <option value="git.blame_line">Git blame line</option>
+            </optgroup>
+            <optgroup label="Network">
+              <option value="http.fetch">HTTP fetch</option>
+            </optgroup>
+            <optgroup label="Data">
+              <option value="json.valid">JSON is valid</option>
+              <option value="json.path">JSON key value</option>
+              <option value="math.evaluate">Math evaluates</option>
+              <option value="text.contains">Text contains (AI-supplied)</option>
+            </optgroup>
+          </select>
+          <input name="path" id="path-input"     placeholder="Path / URL / expression…">
+          <input name="expected" id="expected-input" placeholder="Expected value">
+          <button type="submit" id="verify-btn">Verify</button>
+        </form>
+        <div id="form-error" class="form-error" hidden></div>
+      </section>
+
+      <section class="grid">
+        <div class="panel">
+          <div class="panel-title">Claims</div>
+          <div id="claims-error" class="panel-error" hidden></div>
+          <div id="claims" class="claims"></div>
+        </div>
+        <div class="panel">
+          <div class="panel-title">Evidence</div>
+          <pre id="details" class="details">Select a claim to inspect its evidence chain.</pre>
+        </div>
+      </section>
+    </main>
+
+    <!-- Changelog dialog -->
+    <dialog id="changelog-dialog" aria-label="Changelog">
+      <div class="dialog-header">
+        <h2>Changelog</h2>
+        <button id="changelog-close" class="ghost-btn" type="button" autofocus>✕ Close</button>
+      </div>
+      <div id="changelog-body" class="changelog-body">Loading…</div>
+    </dialog>
+
+    <script src="/app.js" type="module"></script>
+  </body>
+</html>

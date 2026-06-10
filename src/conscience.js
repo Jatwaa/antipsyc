@@ -1,0 +1,935 @@
+/**
+ * Conscience Module — 20 Anti-Hallucination Tactics
+ *
+ * Auto-applied hooks (wired into submitClaim / verifyClaim in server.js):
+ *   #3  detectContradiction      — flags new claims that conflict with verified ledger evidence
+ *   #6  isDestructiveClaim       — detects delete/remove/wipe patterns; requires double-verify
+ *   #8  scoreReasoningTrace      — penalises claims submitted without a reasoning field
+ *   #9  recordCalibration        — tracks claimed-vs-actual confidence drift per validator
+ *   #10 detectSycophancy         — flags echo / leading-question framing
+ *   #20 constitutionalViolations — checks claim+validator against operator-defined principles
+ *
+ * Explicit MCP tools (exported for use in server.js tool handlers):
+ *   #1  declareAction / confirmDone / listIntents
+ *   #2  pauseAndVerify
+ *   #4  runVerificationChain
+ *   #5/#15 retrievalGate
+ *   #7  constitutionalCheck
+ *   #11 consistencyVote
+ *   #13 humanAttest / getAttestation
+ *   #14 planVerification  (Chain-of-Verification)
+ *   #16 semanticChallenge
+ *   #17 startActionTrace / addTraceCycle / completeActionTrace / getTrace
+ *   #18 iterativeVerify
+ *   #19 verifyExecution   (returns a verify_claim plan — runs nothing itself)
+ *       calibrationReport
+ */
+
+import { randomUUID } from "node:crypto";
+import { VALIDATOR_TTL_SECONDS } from "./validators.js";
+
+// ── In-memory session state ────────────────────────────────────────────────
+const intentStore = new Map();   // intentId → intent record
+const traceStore  = new Map();   // traceId  → trace record
+const attestStore = new Map();   // claimId  → attestation
+const calibLog    = [];          // rolling window of calibration records
+
+const MAX_CALIB = 200;
+// F9: long-running servers must not leak — evict oldest entries beyond cap.
+const MAX_SESSION_RECORDS = 500;
+function capMap(map, max = MAX_SESSION_RECORDS) {
+  while (map.size > max) map.delete(map.keys().next().value);
+}
+
+// F5a: word-boundary scope matching (shared with contracts.js semantics) —
+// "pass" must not fire inside "Compass", "user" not inside "user-service".
+function scopeWordInText(text, word) {
+  const esc = String(word).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(?:^|[^\\w-])${esc}(?:[^\\w-]|$)`, "i").test(String(text));
+}
+
+// ── Destructive action vocabulary ─────────────────────────────────────────
+const DESTRUCTIVE_WORDS = new Set([
+  "delete", "deleted", "deletes", "deleting",
+  "remove", "removed", "removes", "removing",
+  "clear",  "cleared",  "clears",  "clearing",
+  "drop",   "dropped",  "drops",   "dropping",
+  "reset",  "truncate", "truncated",
+  "destroy","destroyed","wipe",    "wiped",
+  "erase",  "erased",   "purge",   "purged",
+]);
+
+// ── Sycophancy patterns ────────────────────────────────────────────────────
+const SYCOPHANCY_PATTERNS = [
+  /\bright\??\s*$/i,
+  /\bcorrect\??\s*$/i,
+  /\bas expected\??\s*$/i,
+  /\bisn'?t it\??\s*$/i,
+  /\bdon'?t you think\??\s*$/i,
+  /\bwould you agree\??\s*$/i,
+  /^confirm that\b/i,
+  /^verify that i\b/i,
+  /^please confirm\b/i,
+  /as you (said|requested|asked|mentioned)\b/i,
+  /that'?s? (what you|what we|correct|right)\b/i,
+  /\bjust as (i|we) (said|described|expected)\b/i,
+];
+
+// ── Scope mismatch: qualitative words that narrow validators cannot prove ──
+const SCOPE_MISMATCH = {
+  secure:      ["filesystem.exists","filesystem.stat","file.contains","file.matches","git.file_exists","git.contains","git.log_contains","codebase.contains"],
+  security:    ["filesystem.exists","filesystem.stat","file.contains","file.matches","git.file_exists","git.contains","codebase.contains"],
+  safe:        ["filesystem.exists","filesystem.stat","file.contains","file.matches"],
+  safely:      ["filesystem.exists","filesystem.stat","file.contains","file.matches"],
+  healthy:     ["filesystem.exists","filesystem.stat","file.contains"],
+  health:      ["filesystem.exists","filesystem.stat","file.contains"],
+  correct:     ["filesystem.exists","filesystem.stat","file.contains","file.matches"],
+  correctly:   ["filesystem.exists","filesystem.stat","file.contains","file.matches"],
+  valid:       ["filesystem.exists","filesystem.stat"],
+  complete:    ["filesystem.exists","filesystem.stat","file.contains"],
+  compliant:   ["filesystem.exists","filesystem.stat","file.contains","file.matches","git.log_contains"],
+  compliance:  ["filesystem.exists","filesystem.stat","file.contains","file.matches","git.log_contains"],
+  passing:     ["filesystem.exists","filesystem.stat","file.contains","file.matches"],
+  deployed:    ["filesystem.exists","filesystem.stat","file.contains"],
+  operational: ["filesystem.exists","filesystem.stat","file.contains"],
+  production:  ["filesystem.exists","filesystem.stat","file.contains"],
+  stable:      ["filesystem.exists","filesystem.stat","file.contains"],
+  approved:    ["filesystem.exists","filesystem.stat","file.contains","git.log_contains"],
+};
+
+// ── Validator domain descriptions ─────────────────────────────────────────
+const VALIDATOR_DOMAINS = {
+  "filesystem.exists": "path existence only",
+  "filesystem.stat":   "file metadata (size, dates, type)",
+  "file.contains":     "presence of a literal substring in file text",
+  "file.matches":      "presence of a regex pattern in file text",
+  "code.run":          "JavaScript execution output in a VM sandbox",
+  "http.fetch":        "HTTP response status code",
+  "text.contains":     "AI-supplied text content (low trust — not grounded)",
+  "json.path":         "value at a dot-notation JSON key",
+  "git.file_exists":   "file existence at a git ref",
+  "git.contains":      "substring in a file at a git ref",
+  "git.log_contains":  "substring in recent commit messages",
+  "math.evaluate":     "arithmetic expression result",
+  "codebase.contains": "substring/pattern across files matching a glob",
+  "process.run":       "process exit code and stdout",
+  "retrieve_and_ground": "claim terms present in a fetched URL's body text",
+};
+
+// ── Runtime-state validators (can prove service is live) ──────────────────
+const RUNTIME_VALIDATORS = new Set(["http.fetch", "process.run"]);
+
+// ── Constitutional principles ─────────────────────────────────────────────
+function loadPrinciples() {
+  const defaults = [
+    {
+      id: "P1",
+      rule: "File content claims require file.contains or file.matches evidence",
+      claimPattern: /\b(contains?|includes?|has the text|written to|inside|found in)\b/i,
+      requiredValidators: ["file.contains", "file.matches", "codebase.contains"],
+    },
+    {
+      id: "P2",
+      rule: "Code correctness claims require code.run evidence",
+      claimPattern: /\b(works?|runs?|executes?|outputs?|returns?|computes?|produces?|prints?)\b/i,
+      requiredValidators: ["code.run"],
+    },
+    {
+      id: "P3",
+      rule: "HTTP reachability claims require http.fetch evidence",
+      claimPattern: /\b(reachable|accessible|returns? 200|responds?|is up|is live|is running|online)\b/i,
+      requiredValidators: ["http.fetch"],
+    },
+    {
+      id: "P4",
+      rule: "Git state claims require git validator evidence",
+      claimPattern: /\b(committed|pushed|merged|in git|in version control|in the repo|branched)\b/i,
+      requiredValidators: ["git.file_exists","git.contains","git.branch_exists","git.log_contains","git.last_modified"],
+    },
+    {
+      id: "P5",
+      rule: "Package dependency claims require json.path or file.contains evidence",
+      claimPattern: /\b(installed|depends? on|requires?|package|dependency|npm|yarn)\b/i,
+      requiredValidators: ["json.path", "file.contains"],
+    },
+  ];
+
+  try {
+    const raw = process.env.ANTIPSYC_PRINCIPLES;
+    if (raw) return [...defaults, ...JSON.parse(raw)];
+  } catch { /* ignore invalid JSON */ }
+
+  return defaults;
+}
+
+// ── Action manifests (declare_action) ─────────────────────────────────────
+const ACTION_MANIFESTS = {
+  file_write: ({ path, contains }) => [
+    { step: 1, validator: "filesystem.exists", path, description: `Confirm ${path} was created` },
+    ...(contains ? [{ step: 2, validator: "file.contains", path, contains, description: "Confirm written content is present" }] : []),
+  ],
+  file_delete: ({ path }) => [
+    { step: 1, validator: "filesystem.exists", path, expectAbsent: true, description: `Confirm ${path} no longer exists` },
+  ],
+  file_edit: ({ path, contains }) => [
+    { step: 1, validator: "filesystem.exists", path, description: `Confirm ${path} still exists` },
+    ...(contains ? [{ step: 2, validator: "file.contains", path, contains, description: "Confirm edit is present in file" }] : []),
+  ],
+  code_run: ({ code, expectedOutput }) => [
+    { step: 1, validator: "code.run", code, expectedOutput, description: "Confirm code produces expected output" },
+  ],
+  http_check: ({ url, expectedStatus }) => [
+    { step: 1, validator: "http.fetch", url, expectedStatus: expectedStatus || 200, description: `Confirm ${url} responds ${expectedStatus || 200}` },
+  ],
+  package_install: ({ lib }) => [
+    { step: 1, validator: "file.contains", path: "package.json", contains: `"${lib}"`, description: `Confirm "${lib}" appears in package.json` },
+  ],
+  git_commit: ({ path }) => [
+    { step: 1, validator: "git.last_modified", path: path || ".", description: "Confirm file has recent git commit" },
+  ],
+};
+
+function inferActionType(action) {
+  const a = String(action).toLowerCase();
+  if (/\b(delete|remov|clear|drop|reset|wipe|erase|purg)\b/.test(a)) return "file_delete";
+  if (/\b(install|add.*depend|npm install|yarn add)\b/.test(a)) return "package_install";
+  if (/\b(commit|push|merge)\b/.test(a)) return "git_commit";
+  if (/\b(write|create|generate|save)\b.*\.(js|ts|jsx|tsx|py|json|md|css|html|sh|yaml|yml)/.test(a)) return "file_write";
+  if (/\b(edit|modif|update|change|patch)\b.*\.(js|ts|jsx|tsx|py|json|md|css|html)/.test(a)) return "file_edit";
+  if (/\b(run|execute|test)\b.*\b(code|script|function|snippet)\b/.test(a)) return "code_run";
+  if (/\b(fetch|ping|check|request)\b.*\bhttp/.test(a)) return "http_check";
+  return "generic";
+}
+
+// ── Shared HALT builder ───────────────────────────────────────────────────
+function halt(tactic, directive, required_steps = [], opts = {}) {
+  return {
+    gate:           "HALT",
+    tactic,
+    directive,
+    required_steps,
+    resume_when:    opts.resumeWhen || "Complete all required_steps (each must return verified=true), then proceed.",
+    do_not_assert:  true,
+    timestamp:      new Date().toISOString(),
+    ...opts,
+  };
+}
+
+// ── Text extraction helpers ───────────────────────────────────────────────
+function extractFilePaths(text) {
+  const rx = /(?:^|[\s"'`(])((\.{0,2}\/)?[\w\-]+(?:\/[\w\-]+)*\.(?:js|ts|jsx|tsx|py|json|md|css|html|sh|yaml|yml|env|txt|go|rs|rb|java|c|cpp|h))/g;
+  return [...text.matchAll(rx)].map(m => m[1]).filter(Boolean);
+}
+
+function extractUrls(text) {
+  return [...text.matchAll(/https?:\/\/[^\s"'`<>)]+/g)].map(m => m[0]);
+}
+
+function extractQuotedStrings(text) {
+  return [...text.matchAll(/["'`]([^"'`]{3,80})["'`]/g)].map(m => m[1]).filter(Boolean);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// #1  Intent tracking — declare_action / confirm_done
+// ─────────────────────────────────────────────────────────────────────────
+
+export function declareAction(input) {
+  if (!input.action) throw new Error("action is required");
+  const actionType = input.actionType || inferActionType(input.action);
+  const manifestFn = ACTION_MANIFESTS[actionType];
+  const manifest   = manifestFn ? manifestFn(input.parameters || {}) : [];
+
+  const intent = {
+    id:         randomUUID(),
+    action:     String(input.action),
+    actionType,
+    parameters: input.parameters || {},
+    manifest,
+    openedAt:   new Date().toISOString(),
+    closedAt:   null,
+    status:     "open",
+  };
+  intentStore.set(intent.id, intent);
+  capMap(intentStore);
+
+  return {
+    intentId:   intent.id,
+    action:     intent.action,
+    actionType,
+    status:     "open",
+    manifest,
+    step_count: manifest.length,
+    directive:  manifest.length
+      ? `You must run ${manifest.length} verification step(s) using verify_claim before claiming this action is complete. Then call confirm_done.`
+      : "No standard manifest for this action type. Call confirm_done and provide evidenceClaimIds.",
+    resume_when: "Call confirm_done(intentId) after all manifest verifications return verified=true.",
+  };
+}
+
+export function confirmDone(input) {
+  if (!input.intentId) throw new Error("intentId is required");
+  const intent = intentStore.get(input.intentId);
+  if (!intent) {
+    return halt("confirm_done",
+      `Intent "${input.intentId}" not found. Use declare_action first to register your intent.`,
+      [{ action: "Call declare_action to register what you are about to do before claiming completion." }]
+    );
+  }
+  if (intent.status === "closed") {
+    return { gate: "PROCEED", tactic: "intent_tracking", intentId: intent.id, message: "Intent already closed.", closedAt: intent.closedAt };
+  }
+  intent.closedAt = new Date().toISOString();
+  intent.status   = "closed";
+  intentStore.set(intent.id, intent);
+  return {
+    gate:     "PROCEED",
+    tactic:   "intent_tracking",
+    intentId: intent.id,
+    action:   intent.action,
+    closedAt: intent.closedAt,
+    message:  "Intent closed. Evidence chain recorded. You may now assert completion.",
+  };
+}
+
+export function listIntents() {
+  return [...intentStore.values()];
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// #2  Deliberation gate — pause_and_verify
+// ─────────────────────────────────────────────────────────────────────────
+
+export function pauseAndVerify(input) {
+  const claim  = String(input.claim || input.statement || "");
+  const paths  = extractFilePaths(claim);
+  const urls   = extractUrls(claim);
+  const quoted = extractQuotedStrings(claim);
+  const isDestr = isDestructiveClaim(claim);
+
+  const steps = [];
+  let i = 1;
+
+  for (const p of [...new Set(paths)].slice(0, 4)) {
+    steps.push({ step: i++, action: `verify_claim { validator: "filesystem.exists", path: "${p}" }` });
+    if (quoted.length) {
+      steps.push({ step: i++, action: `verify_claim { validator: "file.contains", path: "${p}", contains: "${quoted[0].slice(0, 60)}" }` });
+    }
+  }
+  for (const u of [...new Set(urls)].slice(0, 2)) {
+    steps.push({ step: i++, action: `verify_claim { validator: "http.fetch", url: "${u}", expectedStatus: 200 }` });
+  }
+  if (!paths.length && !urls.length) {
+    steps.push({ step: i++, action: "Identify the external artifact this claim refers to (file path, URL, git ref, math expression)" });
+    steps.push({ step: i++, action: "Call verify_claim with the appropriate validator for that artifact" });
+  }
+  if (isDestr) {
+    steps.push({ step: i++, action: "DESTRUCTIVE CLAIM: run a second independent validator confirming the destruction (e.g. filesystem.exists returning false)" });
+  }
+  steps.push({ step: i++, action: "Call gate_check with verified=true and the returned realityWeight — proceed only when gate returns 'verified'" });
+
+  return halt(
+    "pause_and_verify",
+    `STOP. Before asserting: "${claim.slice(0, 120)}${claim.length > 120 ? "…" : ""}" — complete every step below.`,
+    steps,
+    { resumeWhen: "gate_check returns gate: 'verified' for this claim." }
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// #3  Contradiction detection (auto-applied hook)
+// ─────────────────────────────────────────────────────────────────────────
+
+export function detectContradiction(statement, existingClaims) {
+  const stmt   = String(statement || "").toLowerCase();
+  const tokens = stmt.split(/\W+/).filter(w => w.length > 3);
+  const NEG_RE = /\b(not|no|never|doesn'?t|didn'?t|won'?t|isn'?t|aren'?t|wasn'?t|absent|missing|doesn't exist)\b/;
+
+  for (const claim of existingClaims) {
+    // Use claim-level realityWeight (set by appendEvidence on each verify run)
+    // listClaims() returns these fields directly — no evidence hydration needed.
+    const rw = claim.realityWeight ?? 0;
+    if (rw < 0.75) continue;
+    if (!["verified", "contradicted"].includes(claim.status ?? "")) continue;
+
+    const existingStmt = String(claim.statement || "").toLowerCase();
+    const overlap = tokens.filter(t => existingStmt.includes(t)).length / Math.max(tokens.length, 1);
+    if (overlap < 0.35) continue;
+
+    const newNeg = NEG_RE.test(stmt);
+    const oldNeg = NEG_RE.test(existingStmt);
+    if (newNeg === oldNeg) continue; // same polarity — not a contradiction
+
+    return {
+      contradictionDetected: true,
+      conflicting_claim: {
+        id:            claim.id,
+        statement:     claim.statement,
+        realityWeight: rw,
+        status:        claim.status,
+      },
+      directive: `A prior ${claim.status} claim (rw=${rw}) contradicts this new claim. Resolve or provide superseding evidence.`,
+    };
+  }
+  return null;
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// #4  Verification chain
+// ─────────────────────────────────────────────────────────────────────────
+
+export async function runVerificationChain(input, verifyFn) {
+  const steps = Array.isArray(input.steps) ? input.steps : [];
+  if (!steps.length) throw new Error("steps[] is required — each element is a verify_claim input object");
+
+  const results = [];
+  for (const [i, step] of steps.entries()) {
+    const r  = await verifyFn(step);
+    const ev = r.evidence || r;
+    results.push({ step: i + 1, label: step.description || step.validator, evidence: ev });
+
+    if (!ev.verified) {
+      return halt(
+        "verification_chain",
+        `Chain failed at step ${i + 1}: "${step.description || step.validator}". Fix and re-run the full chain.`,
+        [{ step: i + 1, action: `Re-verify: ${JSON.stringify({ validator: step.validator, ...step })}` }],
+        { completedSteps: i, totalSteps: steps.length, resumeWhen: "All chain steps verified." }
+      );
+    }
+  }
+
+  return {
+    gate:    "PROCEED",
+    tactic:  "verification_chain",
+    message: `All ${steps.length} chain step(s) verified.`,
+    steps:   results,
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// #5 / #15  Retrieval gate
+// ─────────────────────────────────────────────────────────────────────────
+
+export function retrievalGate(input, existingClaims = []) {
+  const validator = String(input.validator || "");
+  const stmt      = String(input.statement || "").toLowerCase();
+
+  // UNSUPPORTABLE: scope word + narrow validator mismatch
+  for (const [word, narrowList] of Object.entries(SCOPE_MISMATCH)) {
+    if (scopeWordInText(stmt, word) && narrowList.includes(validator)) {
+      return {
+        signal:    "UNSUPPORTABLE",
+        reason:    `Claim contains "${word}" — a qualitative scope word "${validator}" cannot verify.`,
+        directive: `Remove "${word}" from the claim statement or use a semantic/execution validator.`,
+      };
+    }
+  }
+
+  const claim = existingClaims.find(c => c.id === input.claimId || c.statement === input.statement);
+  if (!claim?.evidence?.length) {
+    return { signal: "MISSING", reason: "No evidence exists for this claim. Run verify_claim first." };
+  }
+
+  const latest = [...claim.evidence].reverse().find(e => e.validator === validator);
+  if (!latest) {
+    return { signal: "MISSING", reason: `No "${validator}" evidence found for this claim.` };
+  }
+
+  const ttl = VALIDATOR_TTL_SECONDS[validator];
+  if (ttl === null) return { signal: "FRESH", reason: "Deterministic validator — evidence never expires.", realityWeight: latest.realityWeight };
+
+  const ageSeconds = (Date.now() - new Date(latest.timestamp ?? 0).getTime()) / 1000;
+  if (ageSeconds > ttl) {
+    return {
+      signal:    "STALE",
+      ageMinutes: Math.round(ageSeconds / 60),
+      ttlMinutes: Math.round(ttl / 60),
+      reason:    `Evidence is ${Math.round(ageSeconds / 60)}m old (TTL ${Math.round(ttl / 60)}m). Re-verify before asserting.`,
+      directive: halt("retrieval_gate", "Evidence is stale. Re-verify before asserting.",
+        [{ action: `Call verify_claim with validator: "${validator}" to refresh evidence.` }]),
+    };
+  }
+
+  return {
+    signal:        "FRESH",
+    ageMinutes:    Math.round(ageSeconds / 60),
+    ttlMinutes:    Math.round(ttl / 60),
+    realityWeight: latest.realityWeight,
+    verifiedAt:    latest.timestamp,
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// #6  Destructive claim detection (auto-applied hook)
+// ─────────────────────────────────────────────────────────────────────────
+
+export function isDestructiveClaim(statement) {
+  const words = String(statement || "").toLowerCase().split(/\W+/);
+  return words.some(w => DESTRUCTIVE_WORDS.has(w));
+}
+
+export function destructiveClaimDirective(statement) {
+  return halt(
+    "destructive_double_verify",
+    `Destructive action detected in: "${String(statement).slice(0, 100)}". Two independent validators required before asserting.`,
+    [
+      { step: 1, action: "Run primary validator confirming the destruction/removal state" },
+      { step: 2, action: "Run a SECOND independent validator (e.g. filesystem.exists returning false, or git.last_modified showing removal commit)" },
+    ],
+    { resumeWhen: "Both validators return consistent results confirming the destructive state." }
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// #7  Constitutional check
+// ─────────────────────────────────────────────────────────────────────────
+
+export function constitutionalCheck(input) {
+  const statement  = String(input.statement || "");
+  const validator  = String(input.validator || "");
+  const principles = loadPrinciples();
+  const violations = [];
+
+  for (const p of principles) {
+    if (!p.claimPattern.test(statement)) continue;
+    if (!p.requiredValidators.length)    continue;
+    if (p.requiredValidators.includes(validator)) continue;
+    violations.push({
+      principleId: p.id,
+      rule:        p.rule,
+      required:    p.requiredValidators,
+      provided:    validator || "(none)",
+      resolution:  `Use one of: ${p.requiredValidators.join(", ")}`,
+    });
+  }
+
+  if (!violations.length) return { passed: true, principlesChecked: principles.length };
+
+  return {
+    passed:        false,
+    violations,
+    gate:          "HALT",
+    tactic:        "constitutional_check",
+    directive:     `${violations.length} constitutional principle(s) violated. Resolve before asserting.`,
+    do_not_assert: true,
+    timestamp:     new Date().toISOString(),
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// #8  Reasoning trace (auto-applied hook — returns penalty applied to rw)
+// ─────────────────────────────────────────────────────────────────────────
+
+export function scoreReasoningTrace(input) {
+  const r = String(input.reasoning || "").trim();
+  if (!r)           return { penalty: 0.25, reason: "No reasoning field — claim starts at reduced realityWeight." };
+  if (r.length < 60)  return { penalty: 0.15, reason: "Reasoning too brief to be substantive." };
+  if (r.length < 150) return { penalty: 0.05, reason: "Reasoning is present but brief." };
+  return { penalty: 0, reason: "Adequate reasoning provided." };
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// #9  Calibration tracking (auto-applied hook)
+// ─────────────────────────────────────────────────────────────────────────
+
+export function recordCalibration(validator, claimedConfidence, actualRealityWeight) {
+  if (claimedConfidence == null) return;
+  calibLog.push({
+    validator,
+    claimed:    Number(claimedConfidence),
+    actual:     Number(actualRealityWeight),
+    divergence: Number(claimedConfidence) - Number(actualRealityWeight),
+    timestamp:  new Date().toISOString(),
+  });
+  if (calibLog.length > MAX_CALIB) calibLog.shift();
+}
+
+export function getCalibrationAlert(validator) {
+  const recent = calibLog.filter(r => r.validator === validator).slice(-10);
+  if (recent.length < 3) return null;
+  const avg = recent.reduce((s, r) => s + r.divergence, 0) / recent.length;
+  if (avg <= 0.20) return null;
+  return {
+    alert:         "calibration_drift",
+    validator,
+    avgDivergence: Math.round(avg * 100) / 100,
+    sampleSize:    recent.length,
+    message:       `You are consistently overclaiming confidence for "${validator}" by ~${Math.round(avg * 100)}%. Lower claimedConfidence for this validator type.`,
+  };
+}
+
+export function calibrationReport() {
+  const byValidator = {};
+  for (const r of calibLog) {
+    (byValidator[r.validator] ??= []).push(r.divergence);
+  }
+  return Object.entries(byValidator).map(([v, divs]) => {
+    const avg = divs.reduce((s, d) => s + d, 0) / divs.length;
+    return {
+      validator:     v,
+      samples:       divs.length,
+      avgDivergence: Math.round(avg * 100) / 100,
+      status:        avg > 0.20 ? "overclaiming" : avg < -0.10 ? "underclaiming" : "calibrated",
+    };
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// #10  Sycophancy detection (auto-applied hook)
+// ─────────────────────────────────────────────────────────────────────────
+
+export function detectSycophancy(statement) {
+  const stmt = String(statement || "");
+  for (const pat of SYCOPHANCY_PATTERNS) {
+    if (pat.test(stmt)) {
+      return {
+        sycophancyDetected: true,
+        pattern:   pat.toString(),
+        rwPenalty: 0.15,
+        directive: "Claim appears to be framed as a confirmation request or echo. Verify independently — do not derive the claim from conversation context alone.",
+      };
+    }
+  }
+  return null;
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// #11  Consistency vote
+// ─────────────────────────────────────────────────────────────────────────
+
+export async function consistencyVote(input, verifyFn) {
+  const n     = Math.min(Math.max(Number(input.n || 3), 2), 5);
+  const check = input.check;
+  if (!check?.validator) throw new Error("check.validator is required");
+
+  const results = [];
+  for (let i = 0; i < n; i++) {
+    // force:true bypasses the fresh-evidence cache — a consistency vote
+    // exists to RE-observe, so cached results would defeat its purpose.
+    const r  = await verifyFn({ ...check, force: true });
+    const ev = r.evidence || r;
+    results.push({
+      run:          i + 1,
+      verified:     ev.verified     ?? false,
+      contradicted: ev.contradicted ?? false,
+      realityWeight: ev.realityWeight ?? 0,
+    });
+  }
+
+  const vCount = results.filter(r => r.verified).length;
+  const cCount = results.filter(r => r.contradicted).length;
+  const avgRw  = results.reduce((s, r) => s + r.realityWeight, 0) / n;
+
+  if (vCount === n) return { gate: "PROCEED", tactic: "consistency_vote", verdict: "unanimous_verified",     runs: n, avgRealityWeight: avgRw, results };
+  if (cCount === n) return { ...halt("consistency_vote", `Claim unanimously contradicted across ${n} runs.`, [], { resumeWhen: "Investigate and correct the underlying issue." }), verdict: "unanimous_contradicted", results };
+
+  return halt(
+    "consistency_vote",
+    `Inconsistent results across ${n} runs (${vCount} verified, ${cCount} contradicted, ${n - vCount - cCount} inconclusive). Do not assert until consistent.`,
+    [{ action: "Investigate why validator results differ. The claim may be ill-formed or the artifact state is non-deterministic." }],
+    { verdict: "inconsistent", runs: n, results }
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// #13  Human attestation
+// ─────────────────────────────────────────────────────────────────────────
+
+export function humanAttest(input) {
+  if (!input.claimId)        throw new Error("claimId is required");
+  if (input.approved == null) throw new Error("approved (boolean) is required");
+
+  // F3: a "human" attestation callable by the model itself is no attestation.
+  // When ANTIPSYC_ATTEST_KEY is set, the caller must present it. The key
+  // must be supplied by the human operator out-of-band — never placed in the
+  // model's context or system prompt.
+  const requiredKey = process.env.ANTIPSYC_ATTEST_KEY;
+  if (requiredKey && String(input.operatorKey || "") !== requiredKey) {
+    return halt(
+      "human_attest",
+      "Attestation rejected: missing or invalid operatorKey. Human attestation requires the ANTIPSYC_ATTEST_KEY credential supplied by the operator out-of-band.",
+      [{ action: "Ask the human operator to submit the attestation with their operatorKey (e.g. via the web UI or a direct API call)." }]
+    );
+  }
+
+  const attest = {
+    claimId:      String(input.claimId),
+    approved:     Boolean(input.approved),
+    reason:       String(input.reason || ""),
+    operatorNote: input.operatorNote || null,
+    attestedAt:   new Date().toISOString(),
+    rwDelta:      input.approved ? 0.15 : -1.0,
+  };
+  attestStore.set(attest.claimId, attest);
+  capMap(attestStore);
+
+  return {
+    attestation:   attest,
+    gate:          input.approved ? "PROCEED" : "HALT",
+    tactic:        "human_attest",
+    directive:     input.approved
+      ? "Human operator approved. realityWeight boosted by +0.15."
+      : `Human operator REJECTED: "${input.reason}". Mark this claim as CONTRADICTED. Do not assert.`,
+    do_not_assert: !input.approved,
+  };
+}
+
+export function getAttestation(claimId) {
+  return attestStore.get(claimId) || null;
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// #14  Plan verification — Chain-of-Verification (CoVe)
+// ─────────────────────────────────────────────────────────────────────────
+
+export function planVerification(input) {
+  const claim     = String(input.claim || input.statement || "");
+  const claimType = String(input.claimType || input.type || "general");
+  const paths     = extractFilePaths(claim);
+  const urls      = extractUrls(claim);
+  const quoted    = extractQuotedStrings(claim);
+
+  const steps = [];
+  let i = 1;
+
+  // Also extract bare "contains X" patterns not wrapped in quotes
+  const containsMatch = claim.match(/\bcontains?\s+([`"']?)(\w[\w\s]{2,40})\1/i);
+  const containsHint  = quoted[0] || containsMatch?.[2] || null;
+
+  for (const p of [...new Set(paths)].slice(0, 5)) {
+    steps.push({ step: i++, question: `Does ${p} exist?`,             validator: "filesystem.exists", params: { path: p } });
+    if (containsHint) {
+      steps.push({ step: i++, question: `Does ${p} contain the expected content?`, validator: "file.contains", params: { path: p, contains: containsHint.slice(0, 80) } });
+    }
+  }
+
+  for (const u of [...new Set(urls)].slice(0, 3)) {
+    steps.push({ step: i++, question: `Does ${u} return HTTP 200?`,   validator: "http.fetch", params: { url: u, expectedStatus: 200 } });
+  }
+
+  if (/\b(output|returns?|prints?|computes?|produces?)\b/i.test(claim) || claimType === "code.correctness") {
+    steps.push({ step: i++, question: "Does the code produce the expected output?", validator: "code.run", params: { code: "<your_code_here>", expectedOutput: "<expected_output>" } });
+  }
+
+  if (/\b(committed?|pushed?|in git|version control)\b/i.test(claim)) {
+    steps.push({ step: i++, question: "Does git history confirm this?", validator: "git.log_contains", params: { message: "<commit_message_fragment>" } });
+  }
+
+  if (/\b(package|library|module|dependency|installed)\b/i.test(claim)) {
+    steps.push({ step: i++, question: "Is the package listed in package.json?", validator: "json.path", params: { path: "package.json", keyPath: "dependencies.<libname>", expected: "<version>" } });
+  }
+
+  if (/\b(math|calculate|compute|equals?|result)\b/i.test(claim)) {
+    steps.push({ step: i++, question: "Does the arithmetic check out?", validator: "math.evaluate", params: { expression: "<expression>", expected: "<result>" } });
+  }
+
+  if (!steps.length) {
+    steps.push({ step: 1, question: "What external artifact proves this claim?", validator: "<choose: filesystem.exists | file.contains | code.run | http.fetch | git.log_contains | math.evaluate>", params: {} });
+  }
+
+  return {
+    tactic:      "plan_verification",
+    claim:       claim.slice(0, 200),
+    checklistId: randomUUID(),
+    step_count:  steps.length,
+    steps,
+    directive:   `Execute all ${steps.length} verification step(s) using verify_claim. Do not assert this claim until every step returns verified=true.`,
+    resume_when: "All steps verified → call gate_check to confirm presentability.",
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// #16  Semantic challenge
+// ─────────────────────────────────────────────────────────────────────────
+
+export function semanticChallenge(input) {
+  const statement = String(input.statement || "");
+  const validator = String(input.validator || "");
+  const stmt      = statement.toLowerCase();
+  const challenges = [];
+
+  // Scope mismatch
+  for (const [word, narrowList] of Object.entries(SCOPE_MISMATCH)) {
+    if (scopeWordInText(stmt, word) && narrowList.includes(validator)) {
+      challenges.push({
+        type:       "scope_mismatch",
+        word,
+        validatorProvides: VALIDATOR_DOMAINS[validator] || validator,
+        reason:     `"${validator}" can only prove ${VALIDATOR_DOMAINS[validator] || "its specific domain"} — it cannot speak to "${word}".`,
+        suggestion: `Remove "${word}" from the claim, or use a validator that can verify qualitative properties.`,
+      });
+    }
+  }
+
+  // Runtime-state claims with non-runtime validators
+  if (/\b(running|started|deployed|live|online|up and running)\b/i.test(statement) && !RUNTIME_VALIDATORS.has(validator)) {
+    challenges.push({
+      type:       "runtime_state_mismatch",
+      reason:     `"${validator}" cannot verify runtime state (running/deployed/live). It reads static artifacts.`,
+      suggestion: "Use http.fetch to check a live endpoint, or process.run to check a process.",
+    });
+  }
+
+  // AI-supplied text used for file claims
+  if (validator === "text.contains" && /\b(file|path|directory|source|code)\b/i.test(statement)) {
+    challenges.push({
+      type:       "grounding_weakness",
+      reason:     `"text.contains" checks AI-supplied text, not an actual file. The model can fabricate the text field.`,
+      suggestion: `Use "file.contains" with a real file path to ground this claim in external reality.`,
+    });
+  }
+
+  if (!challenges.length) {
+    return { challenged: false, statement, validator, message: "No semantic scope violations detected.", domain: VALIDATOR_DOMAINS[validator] || null };
+  }
+
+  return {
+    challenged:    true,
+    statement,
+    validator,
+    challenges,
+    gate:          "HALT",
+    tactic:        "semantic_challenge",
+    directive:     `${challenges.length} semantic challenge(s): the validator cannot prove what the claim asserts. Resolve before asserting.`,
+    do_not_assert: true,
+    timestamp:     new Date().toISOString(),
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// #17  Action trace — Reason → Act → Observe
+// ─────────────────────────────────────────────────────────────────────────
+
+export function startActionTrace(input) {
+  const trace = {
+    id:        randomUUID(),
+    claimId:   input.claimId || null,
+    purpose:   String(input.purpose || ""),
+    cycles:    [],
+    startedAt: new Date().toISOString(),
+    complete:  false,
+  };
+  traceStore.set(trace.id, trace);
+  capMap(traceStore);
+  return { traceId: trace.id, message: "Trace started. Call add_trace_cycle for each Reason → Act → Observe cycle before completing." };
+}
+
+export function addTraceCycle(input) {
+  const trace = traceStore.get(input.traceId);
+  if (!trace)          throw new Error(`Trace "${input.traceId}" not found. Call start_action_trace first.`);
+  if (trace.complete)  throw new Error("Trace is already complete.");
+  if (!input.reason)      throw new Error("reason is required");
+  if (!input.action)      throw new Error("action is required");
+  if (input.observation == null) throw new Error("observation is required");
+
+  trace.cycles.push({
+    cycle:       trace.cycles.length + 1,
+    reason:      String(input.reason),
+    action:      String(input.action),
+    observation: input.observation,
+    timestamp:   new Date().toISOString(),
+  });
+  traceStore.set(trace.id, trace);
+  return { traceId: trace.id, cycleCount: trace.cycles.length, lastCycle: trace.cycles.at(-1) };
+}
+
+export function completeActionTrace(input) {
+  const trace = traceStore.get(input.traceId);
+  if (!trace) throw new Error(`Trace "${input.traceId}" not found.`);
+
+  if (!trace.cycles.length) {
+    return halt(
+      "action_trace",
+      "Cannot complete a trace with zero Reason → Act → Observe cycles. You must record at least one cycle before claiming the action is done.",
+      [{ action: "Call add_trace_cycle with reason, action, and observation before completing the trace." }]
+    );
+  }
+
+  trace.complete    = true;
+  trace.completedAt = new Date().toISOString();
+  traceStore.set(trace.id, trace);
+
+  return {
+    gate:        "PROCEED",
+    tactic:      "action_trace",
+    traceId:     trace.id,
+    purpose:     trace.purpose,
+    cycles:      trace.cycles.length,
+    completedAt: trace.completedAt,
+    summary:     trace.cycles.map(c =>
+      `[${c.cycle}] Reason: ${c.reason.slice(0, 50)} → Act: ${c.action.slice(0, 50)} → Observed: ${JSON.stringify(c.observation).slice(0, 60)}`
+    ),
+  };
+}
+
+export function getTrace(traceId) {
+  return traceStore.get(traceId) || null;
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// #18  Iterative verify
+// ─────────────────────────────────────────────────────────────────────────
+
+export async function iterativeVerify(input, verifyFn) {
+  const maxRounds = Math.min(Number(input.maxRounds || 3), 5);
+  const threshold = Number(input.threshold || 0.75);
+  if (!input.validator) throw new Error("validator is required");
+
+  const history = [];
+  for (let round = 1; round <= maxRounds; round++) {
+    // force:true — each round must re-observe, not replay cached evidence.
+    const r  = await verifyFn({ ...input, force: true });
+    const ev = r.evidence || r;
+    const rw = ev.realityWeight ?? 0;
+    history.push({ round, realityWeight: rw, verified: ev.verified ?? false, contradicted: ev.contradicted ?? false });
+
+    // Contradiction must be checked BEFORE the threshold: contradicted
+    // evidence carries a HIGH realityWeight ("confidently false"), which the
+    // threshold test would otherwise read as success. PROCEED additionally
+    // requires verified=true — weight alone is not verification.
+    if (ev.verified === true && !ev.contradicted && rw >= threshold) {
+      return { gate: "PROCEED", tactic: "iterative_verify", rounds: round, finalRealityWeight: rw, threshold, evidence: ev, history };
+    }
+    if (ev.contradicted) {
+      return {
+        ...halt("iterative_verify",
+          `Claim CONTRADICTED on round ${round}. Do not retry without investigating.`,
+          [{ action: "Investigate why the validator returned contradicted. Correct the claim or the artifact, then retry." }],
+          { resumeWhen: "Understand the contradiction. Fix either the claim or the external artifact, then retry." }
+        ),
+        rounds: round, history, evidence: ev,
+      };
+    }
+  }
+
+  return {
+    gate:          "UNVERIFIABLE",
+    tactic:        "iterative_verify",
+    directive:     `After ${maxRounds} rounds, realityWeight (${history.at(-1).realityWeight.toFixed(2)}) never reached threshold (${threshold}). Disclose uncertainty to the user — do not assert this claim.`,
+    do_not_assert: true,
+    rounds:        maxRounds,
+    threshold,
+    history,
+    timestamp:     new Date().toISOString(),
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// #19  Verify execution — returns a ready-made verify_claim call plan
+// ─────────────────────────────────────────────────────────────────────────
+
+export function verifyExecution(input) {
+  if (!input.code)         throw new Error("code is required");
+  if (input.statedOutput == null) throw new Error("statedOutput is required — what the AI claims the code outputs");
+
+  return {
+    tactic:    "verify_execution",
+    directive: "Execute the verify_claim call below to confirm your stated output is correct. Do not assert until verified.",
+    verifyCall: {
+      statement:      `Code execution produces: ${String(input.statedOutput).slice(0, 80)}`,
+      type:           "code.correctness",
+      validator:      "code.run",
+      code:           input.code,
+      expectedOutput: String(input.statedOutput),
+    },
+  };
+}
