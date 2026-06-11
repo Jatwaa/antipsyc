@@ -214,7 +214,15 @@ Two ways it triggers:
 - **Automatically.** A confirmation submitted through `submit_claim` *without* a grounding validator gets a `forcedValidation` HALT attached to the claim. (A confirmation already routed through a real validator is left alone — it is already validating.)
 - **Explicitly.** Call `force_validation({ statement })` (MCP) or `POST /api/conscience/force-validation` to mint the gate yourself.
 
-To close the gate, run the required steps with `verify_claim`, then call `resolve_forced_gate({ gateId, claimIds })` (MCP) or `POST /api/conscience/resolve-gate`. It returns `gate: "PROCEED"` only when at least one grounded validator returned `verified=true` (realityWeight ≥ 0.6) and nothing was contradicted; otherwise it stays `HALT` and tells you what is still missing.
+To close the gate, run the required steps with `verify_claim`, then call `resolve_forced_gate({ gateId, claimIds })` (MCP) or `POST /api/conscience/resolve-gate`. **Resolution is strict** — it returns `gate: "PROCEED"` only when **every artifact the confirmation names** (file, URL, or quoted value) is independently backed by a *distinct* fresh, grounded, fully-`verified` record (`status: "verified"`, `realityWeight ≥ 0.75`, not expired). It refuses to pass on:
+
+- **unrelated true facts** — verifying that `2+2=4` does not satisfy a confirmation about `package.json`;
+- **partial coverage** — if the confirmation names two files, both must be verified;
+- **weak evidence** — `stale`, `simulated`, `syntactic`, or self-supplied `text.contains` evidence is ignored;
+- **any contradiction** — one contradicted record hard-fails the gate (`verdict: "contradicted"`);
+- **vague confirmations** — one that names nothing checkable ("everything works") returns `verdict: "unverifiable_by_tools"` and can *never* auto-pass; it must be decomposed into concrete, named claims.
+
+Raise the bar further with `ANTIPSYC_FORCED_MIN_RW` (default `0.75`).
 
 ```json
 POST /api/conscience/force-validation
@@ -419,6 +427,7 @@ Setting `ANTIPSYC_PROFILE=production` causes the server to refuse to start unles
 | `ANTIPSYC_ATTEST_KEY` | *(unset)* | Operator credential required by `human_attest`. Supply it out-of-band — never place it in the model's context. When unset, attestation is open (dev only). |
 | `ANTIPSYC_ALLOW_LOCAL_HTTP` | *(unset)* | `true` permits `http.fetch` / `retrieve_and_ground` against **loopback only** so an agent can verify its own dev server. RFC-1918, link-local, and broadcast stay blocked. |
 | `ANTIPSYC_TOOLSET` | *(unset)* | `core` exposes a reduced 12-tool MCP surface for token-sensitive clients. |
+| `ANTIPSYC_FORCED_MIN_RW` | `0.75` | Minimum realityWeight a verified record needs to satisfy a forced-validation gate. Raise toward `1.0` for stricter confirmations. |
 | `ANTIPSYC_RATE_LIMIT_LOCAL` | *(unset)* | `true` applies the rate limiter to loopback callers too (exempt by default — the intended caller is a local agent doing batch verification). |
 | `ANTIPSYC_ALLOWED_ROOTS` | Server working directory | Semicolon-separated list of filesystem roots accessible to validators. |
 | `ANTIPSYC_ALLOWED_COMMANDS` | *(empty)* | Comma-separated list of commands permitted by `process.run`. Empty = disabled. |

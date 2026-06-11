@@ -218,7 +218,10 @@ function halt(tactic, directive, required_steps = [], opts = {}) {
 
 // ── Text extraction helpers ───────────────────────────────────────────────
 function extractFilePaths(text) {
-  const rx = /(?:^|[\s"'`(])((\.{0,2}\/)?[\w\-]+(?:\/[\w\-]+)*\.(?:js|ts|jsx|tsx|py|json|md|css|html|sh|yaml|yml|env|txt|go|rs|rb|java|c|cpp|h))/g;
+  // The trailing (?![A-Za-z0-9]) forces the extension to be COMPLETE — without
+  // it the alternation matches ".js" inside ".json" (and ".c" inside ".cpp"),
+  // so "package.json" was mis-extracted as "package.js".
+  const rx = /(?:^|[\s"'`(])((\.{0,2}\/)?[\w\-]+(?:\/[\w\-]+)*\.(?:jsx|tsx|js|ts|py|json|md|css|html|sh|yaml|yml|env|txt|go|rs|rb|java|cpp|c|h)(?![A-Za-z0-9]))/g;
   return [...text.matchAll(rx)].map(m => m[1]).filter(Boolean);
 }
 
@@ -456,9 +459,59 @@ export function listForcedGates() {
   return [...gateStore.values()];
 }
 
-// Resolve a forced gate against the evidence the model produced. `evidence` is
-// a list of evidence records (the server supplies them by looking up claimIds).
-// PROCEED only if grounded verified evidence exists and nothing is contradicted.
+// ── Strict resolution helpers ─────────────────────────────────────────────
+function gateBasename(p) {
+  return String(p || "").replace(/\\/g, "/").split("/").filter(Boolean).pop() || "";
+}
+
+// Validators that produce real, observed external evidence. text.contains is
+// excluded (self-supplied); code.run is "simulated" (excluded by status anyway).
+const GROUNDED_VALIDATORS = new Set([
+  "filesystem.exists", "filesystem.stat", "file.contains", "file.matches",
+  "json.valid", "json.path", "codebase.contains",
+  "git.file_exists", "git.contains", "git.branch_exists",
+  "git.log_contains", "git.last_modified", "git.blame_line",
+  "http.fetch", "math.evaluate", "process.run", "retrieve_and_ground",
+]);
+
+// An evidence record only counts if it is FRESH, GROUNDED, and fully VERIFIED.
+// status must be exactly "verified" — this excludes stale, simulated, syntactic,
+// partial, irrelevant, blocked, and failed evidence.
+function isUsableEvidence(r, minRw) {
+  if (!r || r.verified !== true) return false;
+  if (r.status !== "verified") return false;
+  if ((r.realityWeight ?? 0) < minRw) return false;
+  if (!GROUNDED_VALIDATORS.has(r.validator)) return false;
+  if (r.expiresAt && new Date(r.expiresAt).getTime() <= Date.now()) return false;
+  return true;
+}
+
+function recordCoversPath(r, artifactBase) {
+  const res = r.result || {};
+  if (res.path && gateBasename(res.path).toLowerCase() === artifactBase) return true;
+  if (r.validator === "codebase.contains" && Array.isArray(res.matchedFiles)) {
+    return res.matchedFiles.some(f => gateBasename(f).toLowerCase() === artifactBase);
+  }
+  return false;
+}
+function recordCoversUrl(r, url) {
+  const res = r.result || {};
+  if (!res.url) return false;
+  try {
+    const a = new URL(res.url), b = new URL(url);
+    return a.host === b.host && a.pathname === b.pathname;
+  } catch { return String(res.url).includes(url); }
+}
+function recordCoversQuoted(r, q) {
+  const res = r.result || {};
+  return String(res.contains || "").toLowerCase() === String(q).toLowerCase();
+}
+
+// Resolve a forced gate STRICTLY. PROCEED only when EVERY artifact the
+// confirmation names (file, URL, or quoted value) is independently backed by a
+// distinct fresh, grounded, fully-verified evidence record, and nothing is
+// contradicted. Unrelated true facts, partial coverage, weak/stale evidence, and
+// vague confirmations that name nothing checkable can never pass.
 export function resolveForcedGate(input = {}, evidence = []) {
   const gate = gateStore.get(input.gateId);
   if (!gate) {
@@ -470,37 +523,90 @@ export function resolveForcedGate(input = {}, evidence = []) {
     return { gate: "PROCEED", tactic: "forced_validation", gateId: gate.id, message: "Gate already satisfied.", satisfiedAt: gate.satisfiedAt };
   }
 
+  const minRw   = Number(process.env.ANTIPSYC_FORCED_MIN_RW || 0.75);
   const records = Array.isArray(evidence) ? evidence.filter(Boolean) : [];
+
+  // 1. Any contradiction at all kills the confirmation outright.
   if (records.some(r => r.contradicted === true)) {
     return {
       ...halt("forced_validation",
-        "Validation CONTRADICTED the confirmation. Do not assert — the confirmation was false.",
-        [{ action: "Correct the underlying state or the claim, then re-validate." }],
+        "Validation CONTRADICTED the confirmation. Do not assert — it was checked and found false.",
+        [{ action: "Fix the underlying state or retract the confirmation, then start a new gate." }],
         { gateId: gate.id }),
       verdict: "contradicted",
     };
   }
-  const grounded = records.filter(r =>
-    r.verified === true && r.status === "verified" && (r.realityWeight ?? 0) >= 0.6);
-  if (!grounded.length) {
-    return halt("forced_validation",
-      "No grounded, verified evidence covers this confirmation yet. Run the required_steps with verify_claim, then resolve again.",
-      gate.requiredSteps,
-      { gateId: gate.id, resumeWhen: "At least one grounded validator returns verified=true with realityWeight ≥ 0.6." });
+
+  const usable = records.filter(r => isUsableEvidence(r, minRw));
+
+  // 2. Identify the concrete artifacts the confirmation NAMES.
+  const stmt   = gate.statement;
+  const paths  = [...new Set(extractFilePaths(stmt).map(p => gateBasename(p).toLowerCase()).filter(Boolean))];
+  const urls   = [...new Set(extractUrls(stmt))];
+  const quoted = [...new Set(extractQuotedStrings(stmt))];
+
+  // 3. A confirmation that names nothing checkable cannot be grounded by tools.
+  if (!paths.length && !urls.length && !quoted.length) {
+    return {
+      ...halt("forced_validation",
+        "This confirmation names no checkable artifact (file, URL, or quoted value), so tools cannot ground it. A vague confirmation can never be auto-validated.",
+        [{ action: "Restate it as concrete claims that each name a specific file, URL, command, or value, then verify every one with verify_claim and resolve again." }],
+        { gateId: gate.id }),
+      verdict: "unverifiable_by_tools",
+    };
   }
 
+  // 4. Every named artifact must be covered by its OWN distinct usable record.
+  const used = new Set();
+  const missing = [];
+  const claimRecord = (pred) => {
+    const idx = usable.findIndex((r, i) => !used.has(i) && pred(r));
+    if (idx === -1) return false;
+    used.add(idx);
+    return true;
+  };
+  for (const base of paths) {
+    if (!claimRecord(r => recordCoversPath(r, base))) {
+      missing.push({ artifact: base, need: `a fresh verified filesystem/file/git/codebase check for "${base}"` });
+    }
+  }
+  for (const u of urls) {
+    if (!claimRecord(r => recordCoversUrl(r, u))) {
+      missing.push({ artifact: u, need: `a fresh verified http.fetch for "${u}"` });
+    }
+  }
+  for (const q of quoted) {
+    if (!claimRecord(r => recordCoversQuoted(r, q))) {
+      missing.push({ artifact: q, need: `a fresh verified file.contains proving the exact text "${q}" exists` });
+    }
+  }
+
+  if (missing.length) {
+    return {
+      ...halt("forced_validation",
+        `Not every artifact named in the confirmation is independently verified — ${missing.length} still unproven. The confirmation cannot be asserted.`,
+        missing.map((m, i) => ({ step: i + 1, artifact: m.artifact, action: m.need })),
+        { gateId: gate.id, resumeWhen: `Every named artifact has fresh, grounded, verified evidence (status "verified", realityWeight ≥ ${minRw}).` }),
+      verdict: "incomplete",
+      missing,
+      artifactsNamed: paths.length + urls.length + quoted.length,
+      artifactsVerified: used.size,
+    };
+  }
+
+  // 5. Every artifact independently grounded, nothing contradicted → PROCEED.
   gate.status      = "satisfied";
   gate.satisfiedAt = new Date().toISOString();
-  gate.satisfiedBy = grounded.map(r => r.claimId || r.id).filter(Boolean);
+  gate.satisfiedBy = [...used].map(i => usable[i].claimId || usable[i].id).filter(Boolean);
   gateStore.set(gate.id, gate);
   return {
-    gate:          "PROCEED",
-    tactic:        "forced_validation",
-    gateId:        gate.id,
-    verdict:       "validated",
-    evidenceCount: grounded.length,
-    message:       "Confirmation independently validated by grounded evidence. You may assert it.",
-    satisfiedAt:   gate.satisfiedAt,
+    gate:              "PROCEED",
+    tactic:            "forced_validation",
+    gateId:            gate.id,
+    verdict:           "validated",
+    artifactsVerified: paths.length + urls.length + quoted.length,
+    message:           "Every artifact named in the confirmation is independently grounded by fresh verified evidence. You may assert it.",
+    satisfiedAt:       gate.satisfiedAt,
   };
 }
 

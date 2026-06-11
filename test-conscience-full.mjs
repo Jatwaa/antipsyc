@@ -816,47 +816,71 @@ const rightGate = await tool("gate_check", {
 ok(rightGate.gate === "verified",             "HALT enforcement: verified evidence → gate=verified (assert allowed)");
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// 23.  Forced validation — a confirmation mints a gate on the fly
+// 23.  Forced validation — a confirmation mints a gate on the fly (STRICT)
 // ═══════════════════════════════════════════════════════════════════════════════
-section("23 — forced validation (confirmation → new gate)");
+section("23 — forced validation (confirmation → new gate, strict)");
 
-// A confirmation sent to force_validation creates a fresh gate with real steps
+// A confirmation naming a concrete artifact creates a fresh gate
 const fv = await tool("force_validation", {
-  statement: "The migration completed successfully and the tests are passing",
+  statement: "The config at package.json was written successfully",
 });
 ok(fv.gate === "HALT",                          "force_validation: confirmation → gate=HALT");
 ok(typeof fv.gateId === "string" && fv.gateId.startsWith("gate_"), "force_validation: returns a new gateId");
-ok(Array.isArray(fv.required_steps) && fv.required_steps.length > 0, "force_validation: provides required verify steps");
+ok(Array.isArray(fv.required_steps) && fv.required_steps.length > 0, "force_validation: provides required steps");
 
-// Resolving before any evidence exists must still HALT
+// Resolving before any evidence exists must HALT
 const beforeEv = await tool("resolve_forced_gate", { gateId: fv.gateId });
-ok(beforeEv.gate === "HALT",                    "resolve_forced_gate: no grounded evidence yet → HALT");
+ok(beforeEv.gate === "HALT",                    "resolve: no evidence → HALT");
 
-// A confirmation submitted WITHOUT a grounding validator auto-mints a gate
-const confClaim = await tool("submit_claim", {
-  statement: "Everything is done and working",
-  type:      "confirmation",
+// STRICT: unrelated grounded evidence does NOT satisfy the gate
+const unrelated = await tool("verify_claim", {
+  statement: "2 plus 2 equals 4", validator: "math.evaluate", expression: "2+2", expected: 4,
+  reasoning: "An unrelated true fact used to probe the strict gate — it must NOT satisfy a confirmation about package.json.",
 });
+const stillHalt = await tool("resolve_forced_gate", { gateId: fv.gateId, claimIds: [unrelated.claimId] });
+ok(stillHalt.gate === "HALT",                   "resolve: unrelated grounded evidence does NOT satisfy (strict relevance)");
+
+// Verify the NAMED artifact → PROCEED
+const realCheck = await tool("verify_claim", {
+  statement: "package.json exists on disk", validator: "filesystem.exists",
+  path: join(__dirname, "package.json"),
+  reasoning: "Verifying the exact artifact named in the confirmation so the strict gate can be satisfied.",
+});
+const resolved = await tool("resolve_forced_gate", { gateId: fv.gateId, claimIds: [unrelated.claimId, realCheck.claimId] });
+ok(resolved.gate === "PROCEED",                 "resolve: the named artifact verified → PROCEED");
+ok(resolved.verdict === "validated",            "resolve: verdict=validated");
+
+// STRICT: a vague confirmation that names nothing checkable can never auto-pass
+const vague = await tool("force_validation", { statement: "Everything is done and working" });
+const vagueRes = await tool("resolve_forced_gate", { gateId: vague.gateId, claimIds: [realCheck.claimId] });
+ok(vagueRes.gate === "HALT",                    "resolve: vague confirmation → HALT");
+ok(vagueRes.verdict === "unverifiable_by_tools","resolve: vague confirmation → unverifiable_by_tools");
+
+// STRICT: partial coverage (two files named, one verified) → HALT incomplete
+const two = await tool("force_validation", { statement: "Both package.json and README.md were written" });
+const partial = await tool("resolve_forced_gate", { gateId: two.gateId, claimIds: [realCheck.claimId] });
+ok(partial.gate === "HALT",                     "resolve: partial coverage → HALT");
+ok(Array.isArray(partial.missing) && partial.missing.length >= 1, "resolve: reports the unproven artifact(s)");
+
+// STRICT: contradicted evidence hard-fails the gate
+const gone = await tool("force_validation", { statement: "The file at ghost-confirm-xyz.json was created" });
+const contra = await tool("verify_claim", {
+  statement: "ghost-confirm-xyz.json exists", validator: "filesystem.exists",
+  path: join(__dirname, "ghost-confirm-xyz.json"),
+  reasoning: "This file does not exist — contradicted evidence must hard-fail the forced gate.",
+});
+const contraRes = await tool("resolve_forced_gate", { gateId: gone.gateId, claimIds: [contra.claimId] });
+ok(contraRes.gate === "HALT",                   "resolve: contradicted evidence → HALT");
+ok(contraRes.verdict === "contradicted",        "resolve: verdict=contradicted");
+
+// Auto-hook: a bare confirmation type creates a forced gate
+const confClaim = await tool("submit_claim", { statement: "Everything is done and working", type: "confirmation" });
 ok(confClaim.forcedValidation?.gate === "HALT", "submit_claim: confirmation type auto-creates a forced gate");
 ok(confClaim.confirmationDetected?.signal === "explicit", "submit_claim: explicit confirmation type detected");
 
 // A normal grounded (non-confirmation) claim does NOT get a forced gate
-const groundedClaim = await tool("submit_claim", {
-  statement: "package.json exists at the project root",
-  type:      "filesystem.exists",
-});
+const groundedClaim = await tool("submit_claim", { statement: "package.json exists at the project root", type: "filesystem.exists" });
 ok(!groundedClaim.forcedValidation,             "submit_claim: grounded non-confirmation → no forced gate");
-
-// Produce real grounded evidence, then resolve the gate → PROCEED
-const realCheck = await tool("verify_claim", {
-  statement: "package.json exists on disk",
-  validator: "filesystem.exists",
-  path:      join(__dirname, "package.json"),
-  reasoning: "Forced-gate resolution test — verifying a real file so the gate can be satisfied by grounded evidence.",
-});
-const resolved = await tool("resolve_forced_gate", { gateId: fv.gateId, claimIds: [realCheck.claimId] });
-ok(resolved.gate === "PROCEED",                 "resolve_forced_gate: grounded verified evidence → PROCEED");
-ok(resolved.verdict === "validated",            "resolve_forced_gate: verdict=validated");
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Summary
