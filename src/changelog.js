@@ -283,6 +283,19 @@ export const changelog = [
       { category: "perf",     ref: "F10", description: "Contradiction detection queries only promoted high-confidence claims (indexed, capped) instead of scanning the full ledger on every submission; tool responses use compact JSON; calibration is recorded even on cache hits." },
       { category: "fix",      ref: "F20", description: "Claim reasoning is persisted (SQLite column / JSON field) so re-verification by claimId can see it; intent/trace/attestation session stores are capped at 500 records with FIFO eviction." }
     ]
+  },
+  {
+    version: "0.8.0",
+    label: "v8",
+    released: "2026-06-10",
+    summary: "Forced validation — confirmations mint a fresh gate on the fly",
+    changes: [
+      { category: "feature", description: "Confirmation detection: an input marked type:\"confirmation\" / confirmation:true, or phrased as a completion/echo claim (\"the migration completed successfully\", \"tests are passing\", \"confirm that…\"), is recognized as a confirmation seeking the system's blessing." },
+      { category: "feature", description: "force_validation: a confirmation creates a brand-new validation gate on the fly — a registered gate object (gateId) carrying the concrete verify_claim steps required to ground it. A model's confirmation is never accepted as evidence." },
+      { category: "feature", description: "Auto-hook: a confirmation submitted via submit_claim WITHOUT a grounding validator automatically attaches forcedValidation (a HALT gate) to the claim; confirmations already routed through a real validator are left alone." },
+      { category: "feature", description: "resolve_forced_gate: closes a forced gate after its steps run — gate:PROCEED only when grounded verified evidence exists (rw ≥ 0.6) and nothing is contradicted; otherwise HALT with what is still missing." },
+      { category: "feature", description: "New MCP tools force_validation / resolve_forced_gate / list_forced_gates / get_forced_gate and HTTP routes POST /api/conscience/force-validation, POST /api/conscience/resolve-gate, GET /api/conscience/gates. Orientation gains a confirmations workflow." }
+    ]
   }
 ];
 

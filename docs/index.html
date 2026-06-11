@@ -285,7 +285,7 @@
       <div class="feat"><span class="ic">⚡</span><div><h3>Fresh-evidence cache</h3><p>Re-verifying an identical claim within its TTL returns the ledgered evidence instantly — repeat verification is free.</p></div></div>
       <div class="feat"><span class="ic">✓</span><div><h3>Auto-approvable tools</h3><p>Read-only MCP tools are annotated so clients like Claude Code can run them without a permission prompt.</p></div></div>
       <div class="feat"><span class="ic">⌘</span><div><h3>Speaks MCP &amp; HTTP</h3><p>stdio MCP for agents, a REST API + OpenAPI spec for everything else, and a searchable evidence UI for humans.</p></div></div>
-      <div class="feat"><span class="ic">🛈</span><div><h3>A conscience layer</h3><p>Auto-hooks for contradiction, sycophancy, scope-mismatch and calibration drift — plus intent tracking and chain-of-verification tools.</p></div></div>
+      <div class="feat"><span class="ic">🛈</span><div><h3>A conscience layer</h3><p>Auto-hooks for contradiction, sycophancy, scope-mismatch and calibration drift — plus intent tracking, chain-of-verification, and forced validation of confirmations.</p></div></div>
       <div class="feat"><span class="ic">🔒</span><div><h3>Safe by default</h3><p>SSRF protection, path/root sandboxing, allowlisted process execution, ReDoS-guarded regex, and a production startup guard.</p></div></div>
     </div>
   </div>
@@ -297,10 +297,10 @@
     <p class="eyebrow">Verification &amp; results</p>
     <h2>Tested against its own threat model</h2>
     <p class="lead">Six suites run on every change — exercising every validator, the full MCP protocol, and the conscience layer. The interesting tests aren't the ones that confirm true claims; they're the ones that try to sneak a false claim past the gate.</p>
-    <div class="totbar"><span class="big">293</span><span class="lab"><b>checks · 100% passing</b> on the published build</span></div>
+    <div class="totbar"><span class="big">302</span><span class="lab"><b>checks · 100% passing</b> on the published build</span></div>
     <div class="stat-row">
       <div class="stat"><div class="n">95<small>/95</small></div><div class="s">deterministic salvo</div><div class="d">Every validator, templates &amp; the gate over the HTTP API — known-true and known-false claims with fixed expected outcomes.</div></div>
-      <div class="stat"><div class="n">128<small>/128</small></div><div class="s">conscience suite</div><div class="d">23 sections: gate, auto-hooks, intent tracking, chain-of-verification, consistency vote, and HALT enforcement.</div></div>
+      <div class="stat"><div class="n">137<small>/137</small></div><div class="s">conscience suite</div><div class="d">24 sections: gate, auto-hooks, intent tracking, chain-of-verification, forced validation, and HALT enforcement.</div></div>
       <div class="stat"><div class="n">35<small>/35</small></div><div class="s">MCP protocol</div><div class="d">Handshake, tool listing with annotations, and tool calls over real newline-delimited stdio framing.</div></div>
       <div class="stat"><div class="n">23<small>/23</small></div><div class="s">codebase &amp; git</div><div class="d">Glob-scoped codebase search, the git-history validators, and claim deduplication by fingerprint.</div></div>
       <div class="stat"><div class="n">7<small>/7</small></div><div class="s">adversarial regressions</div><div class="d">Replays of known bypasses — weak, unrelated, self-supplied, or policy-blocked evidence must not promote.</div></div>
@@ -314,6 +314,7 @@
       <div class="row"><span class="att">A high realityWeight claim that evidence <em>contradicted</em></span><span class="arr">→</span><span class="out">gate · suppress</span></div>
       <div class="row"><span class="att">A claim padded with clauses the validator cannot speak to</span><span class="arr">→</span><span class="out">contract · rejected</span></div>
       <div class="row"><span class="att">A fabricated realityWeight handed straight to the gate</span><span class="arr">→</span><span class="out">unattested · suppress</span></div>
+      <div class="row"><span class="att">A model confirms "it's done / tests pass" on its own word</span><span class="arr">→</span><span class="out">new gate · forced validation</span></div>
       <div class="row"><span class="att">Reading a file outside the configured allowed roots</span><span class="arr">→</span><span class="out">blocked</span></div>
       <div class="row"><span class="att">An HTTP probe to loopback or a private IP (SSRF)</span><span class="arr">→</span><span class="out">blocked</span></div>
       <div class="row"><span class="att">A public URL that redirects to a private address</span><span class="arr">→</span><span class="out">blocked at the hop</span></div>

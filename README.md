@@ -203,6 +203,31 @@ The gate requires explicit `verified` and `contradicted` flags. If those flags a
 
 ---
 
+## Forced Validation — Confirmations Mint a Gate on the Fly
+
+A **confirmation** is an input that asserts something is *done*, *correct*, *passing*, or *successful* and asks the system to accept it — either explicitly (`type: "confirmation"` / `confirmation: true`) or by phrasing ("the migration completed successfully", "tests are passing", "confirm that the file was written"). A model's confirmation is not evidence, so AntiPsyc refuses to take it on faith: when a confirmation is detected, it **creates a brand-new validation gate on the fly**.
+
+The gate is a registered object with its own `gateId` and a set of concrete `verify_claim` steps derived from whatever external artifacts the confirmation references (file paths → `filesystem.exists` / `file.contains`, URLs → `http.fetch`, "tests" → `process.run`, "committed" → `git.log_contains`, and so on). Until those steps produce grounded, verified evidence, the confirmation cannot be asserted.
+
+Two ways it triggers:
+
+- **Automatically.** A confirmation submitted through `submit_claim` *without* a grounding validator gets a `forcedValidation` HALT attached to the claim. (A confirmation already routed through a real validator is left alone — it is already validating.)
+- **Explicitly.** Call `force_validation({ statement })` (MCP) or `POST /api/conscience/force-validation` to mint the gate yourself.
+
+To close the gate, run the required steps with `verify_claim`, then call `resolve_forced_gate({ gateId, claimIds })` (MCP) or `POST /api/conscience/resolve-gate`. It returns `gate: "PROCEED"` only when at least one grounded validator returned `verified=true` (realityWeight ≥ 0.6) and nothing was contradicted; otherwise it stays `HALT` and tells you what is still missing.
+
+```json
+POST /api/conscience/force-validation
+{ "statement": "The build is done and the tests are passing" }
+// → { gate: "HALT", gateId: "gate_…", required_steps: [ … ] }
+
+POST /api/conscience/resolve-gate
+{ "gateId": "gate_…", "claimIds": ["claim_…"] }
+// → { gate: "PROCEED", verdict: "validated" }  (only with grounded evidence)
+```
+
+---
+
 ## Templates
 
 Templates are named shortcuts for common claim patterns. They let smaller models submit a short `{ template, fill }` object instead of constructing a full validator payload. Available templates:
@@ -324,6 +349,8 @@ When running in MCP mode (`npm run mcp` or `npm start`), the server exposes thes
 | `get_templates` | List available templates. Call this before `use_template`. |
 | `use_template` | Verify a claim using a named template shortcut. |
 | `gate_check` | Translate a `realityWeight` into a presentability signal. |
+| `force_validation` | Send a confirmation; mint a new validation gate with the required `verify_claim` steps. |
+| `resolve_forced_gate` | Close a forced gate — `PROCEED` only when grounded verified evidence exists. |
 
 ### Recommended Model Workflow
 

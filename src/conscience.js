@@ -32,6 +32,7 @@ import { VALIDATOR_TTL_SECONDS } from "./validators.js";
 const intentStore = new Map();   // intentId → intent record
 const traceStore  = new Map();   // traceId  → trace record
 const attestStore = new Map();   // claimId  → attestation
+const gateStore   = new Map();   // gateId   → forced-validation gate record
 const calibLog    = [];          // rolling window of calibration records
 
 const MAX_CALIB = 200;
@@ -333,6 +334,174 @@ export function pauseAndVerify(input) {
     steps,
     { resumeWhen: "gate_check returns gate: 'verified' for this claim." }
   );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Forced validation — a confirmation creates a fresh gate on the fly
+//
+// A "confirmation" is an input that asserts something is done / correct /
+// successful and asks the system to accept it (explicit type:"confirmation",
+// confirmation:true, or completion/echo phrasing). A model's confirmation is
+// NOT evidence, so instead of accepting it the system mints a brand-new
+// validation gate — a registered gate object with concrete verify_claim steps
+// that must pass before the confirmation may be asserted.
+// ─────────────────────────────────────────────────────────────────────────
+
+// Phrases that mark an input as a confirmation seeking the system's blessing.
+const CONFIRMATION_PATTERNS = [
+  /\bconfirm(s|ed|ing)?\b/i,
+  /\b(is|are|was|were)\s+(it|this|that|the\s+[\w.-]+|everything)\s+(correct|right|done|complete|finished|working|ready|ok|okay|good)\b/i,
+  /\b(did|does|has|have)\s+([\w.-]+|it|this|that|the\s+[\w.-]+)\s+(work|works|worked|succeed|succeeded|pass|passed|complete|completed|finish|finished)\b/i,
+  /\b(everything|it|the\s+[\w.-]+|task|job|build|migration|deployment|tests?|change|update|fix|feature)\s+(is|are|was|were)?\s*(done|complete|completed|finished|ready|working|passing|passed|successful|succeeded|resolved|fixed|deployed|created|installed)\b/i,
+  /\b(successfully|all\s+set|good\s+to\s+go|ready\s+to\s+ship)\b/i,
+  ...SYCOPHANCY_PATTERNS,
+];
+
+// Detect whether an input is a confirmation. Explicit markers win; otherwise
+// the statement is matched against the confirmation phrasings.
+export function detectConfirmation(input = {}) {
+  const markers = [input.type, input.kind, input.intent, input.source]
+    .map(v => String(v || "").toLowerCase());
+  if (input.confirmation === true || markers.includes("confirmation") || markers.includes("confirm")) {
+    return { confirmation: true, signal: "explicit", matched: String(input.type || input.kind || input.intent || "confirmation") };
+  }
+  const text = String(
+    input.statement || input.claim ||
+    (typeof input.confirmation === "string" ? input.confirmation : "") || ""
+  );
+  for (const pat of CONFIRMATION_PATTERNS) {
+    const m = text.match(pat);
+    if (m) return { confirmation: true, signal: "phrasing", matched: m[0].trim().slice(0, 60) };
+  }
+  return null;
+}
+
+// Build the concrete verify_claim steps the gate will force, derived from the
+// external artifacts the confirmation references.
+function forcedValidationSteps(statement) {
+  const text   = String(statement || "");
+  const paths  = [...new Set(extractFilePaths(text))].slice(0, 5);
+  const urls   = [...new Set(extractUrls(text))].slice(0, 3);
+  const quoted = extractQuotedStrings(text);
+  const steps  = [];
+  let i = 1;
+
+  for (const p of paths) {
+    steps.push({ step: i++, validator: "filesystem.exists", params: { path: p }, why: `Confirm ${p} actually exists on disk` });
+    if (quoted.length) {
+      steps.push({ step: i++, validator: "file.contains", params: { path: p, contains: quoted[0].slice(0, 80) }, why: `Confirm ${p} really contains the asserted content` });
+    }
+  }
+  for (const u of urls) {
+    steps.push({ step: i++, validator: "http.fetch", params: { url: u, expectedStatus: 200 }, why: `Confirm ${u} actually responds` });
+  }
+  if (/\b(commit|committed|pushed|merged|in git|version control)\b/i.test(text)) {
+    steps.push({ step: i++, validator: "git.log_contains", params: { message: "<commit message fragment>" }, why: "Confirm the change is really in git history" });
+  }
+  if (/\b(tests?|suite|spec|ci)\b/i.test(text)) {
+    steps.push({ step: i++, validator: "process.run", params: { command: "<test command>", expectedExitCode: 0 }, why: "Run the tests — do not accept 'passing' on faith" });
+  }
+  if (/\b(output|prints?|returns?|computes?|produces?|equals?)\b/i.test(text)) {
+    steps.push({ step: i++, validator: "code.run", params: { code: "<code>", expectedOutput: "<expected>" }, why: "Execute the code and compare real output" });
+  }
+  if (!steps.length) {
+    steps.push({ step: i++, validator: "<choose validator>", params: {}, why: "Identify the external artifact behind this confirmation (file, URL, git ref, command, expression) and verify it with the matching validator." });
+  }
+  return steps;
+}
+
+// Create a brand-new forced-validation gate for a confirmation and register it.
+export function forceValidation(input = {}) {
+  const statement = String(
+    input.statement || input.claim ||
+    (typeof input.confirmation === "string" ? input.confirmation : "") || ""
+  ).trim();
+  if (!statement) throw new Error("statement (or claim) is required to force validation");
+
+  const detected = detectConfirmation(input) || { confirmation: true, signal: "forced", matched: null };
+  const required_steps = forcedValidationSteps(statement);
+
+  const gate = {
+    id:            `gate_${randomUUID()}`,
+    statement,
+    trigger:       detected.signal,
+    matched:       detected.matched,
+    status:        "open",
+    requiredSteps: required_steps,
+    createdAt:     new Date().toISOString(),
+    satisfiedBy:   [],
+  };
+  gateStore.set(gate.id, gate);
+  capMap(gateStore);
+
+  return {
+    gate:        "HALT",
+    tactic:      "forced_validation",
+    gateId:      gate.id,
+    reason:      `A confirmation was received (${detected.signal}${detected.matched ? `: "${detected.matched}"` : ""}). A model's confirmation is not evidence — a new validation gate was created to force grounded checks.`,
+    directive:   `Do NOT accept this confirmation. Complete the ${required_steps.length} required validation step(s) with verify_claim, then call resolve_forced_gate({ gateId: "${gate.id}", claimIds: [...] }).`,
+    statement:   statement.slice(0, 160),
+    required_steps,
+    resume_when: "Every required step returns verified=true and resolve_forced_gate returns gate:PROCEED.",
+    do_not_assert: true,
+    timestamp:   gate.createdAt,
+  };
+}
+
+export function getForcedGate(gateId) {
+  return gateStore.get(gateId) || null;
+}
+
+export function listForcedGates() {
+  return [...gateStore.values()];
+}
+
+// Resolve a forced gate against the evidence the model produced. `evidence` is
+// a list of evidence records (the server supplies them by looking up claimIds).
+// PROCEED only if grounded verified evidence exists and nothing is contradicted.
+export function resolveForcedGate(input = {}, evidence = []) {
+  const gate = gateStore.get(input.gateId);
+  if (!gate) {
+    return halt("forced_validation",
+      `Forced gate "${input.gateId}" not found. Call force_validation first (or it was evicted).`,
+      [{ action: "Re-create the gate with force_validation, then complete its required_steps." }]);
+  }
+  if (gate.status === "satisfied") {
+    return { gate: "PROCEED", tactic: "forced_validation", gateId: gate.id, message: "Gate already satisfied.", satisfiedAt: gate.satisfiedAt };
+  }
+
+  const records = Array.isArray(evidence) ? evidence.filter(Boolean) : [];
+  if (records.some(r => r.contradicted === true)) {
+    return {
+      ...halt("forced_validation",
+        "Validation CONTRADICTED the confirmation. Do not assert — the confirmation was false.",
+        [{ action: "Correct the underlying state or the claim, then re-validate." }],
+        { gateId: gate.id }),
+      verdict: "contradicted",
+    };
+  }
+  const grounded = records.filter(r =>
+    r.verified === true && r.status === "verified" && (r.realityWeight ?? 0) >= 0.6);
+  if (!grounded.length) {
+    return halt("forced_validation",
+      "No grounded, verified evidence covers this confirmation yet. Run the required_steps with verify_claim, then resolve again.",
+      gate.requiredSteps,
+      { gateId: gate.id, resumeWhen: "At least one grounded validator returns verified=true with realityWeight ≥ 0.6." });
+  }
+
+  gate.status      = "satisfied";
+  gate.satisfiedAt = new Date().toISOString();
+  gate.satisfiedBy = grounded.map(r => r.claimId || r.id).filter(Boolean);
+  gateStore.set(gate.id, gate);
+  return {
+    gate:          "PROCEED",
+    tactic:        "forced_validation",
+    gateId:        gate.id,
+    verdict:       "validated",
+    evidenceCount: grounded.length,
+    message:       "Confirmation independently validated by grounded evidence. You may assert it.",
+    satisfiedAt:   gate.satisfiedAt,
+  };
 }
 
 // ─────────────────────────────────────────────────────────────────────────

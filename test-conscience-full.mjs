@@ -816,6 +816,49 @@ const rightGate = await tool("gate_check", {
 ok(rightGate.gate === "verified",             "HALT enforcement: verified evidence → gate=verified (assert allowed)");
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// 23.  Forced validation — a confirmation mints a gate on the fly
+// ═══════════════════════════════════════════════════════════════════════════════
+section("23 — forced validation (confirmation → new gate)");
+
+// A confirmation sent to force_validation creates a fresh gate with real steps
+const fv = await tool("force_validation", {
+  statement: "The migration completed successfully and the tests are passing",
+});
+ok(fv.gate === "HALT",                          "force_validation: confirmation → gate=HALT");
+ok(typeof fv.gateId === "string" && fv.gateId.startsWith("gate_"), "force_validation: returns a new gateId");
+ok(Array.isArray(fv.required_steps) && fv.required_steps.length > 0, "force_validation: provides required verify steps");
+
+// Resolving before any evidence exists must still HALT
+const beforeEv = await tool("resolve_forced_gate", { gateId: fv.gateId });
+ok(beforeEv.gate === "HALT",                    "resolve_forced_gate: no grounded evidence yet → HALT");
+
+// A confirmation submitted WITHOUT a grounding validator auto-mints a gate
+const confClaim = await tool("submit_claim", {
+  statement: "Everything is done and working",
+  type:      "confirmation",
+});
+ok(confClaim.forcedValidation?.gate === "HALT", "submit_claim: confirmation type auto-creates a forced gate");
+ok(confClaim.confirmationDetected?.signal === "explicit", "submit_claim: explicit confirmation type detected");
+
+// A normal grounded (non-confirmation) claim does NOT get a forced gate
+const groundedClaim = await tool("submit_claim", {
+  statement: "package.json exists at the project root",
+  type:      "filesystem.exists",
+});
+ok(!groundedClaim.forcedValidation,             "submit_claim: grounded non-confirmation → no forced gate");
+
+// Produce real grounded evidence, then resolve the gate → PROCEED
+const realCheck = await tool("verify_claim", {
+  statement: "package.json exists on disk",
+  validator: "filesystem.exists",
+  path:      join(__dirname, "package.json"),
+  reasoning: "Forced-gate resolution test — verifying a real file so the gate can be satisfied by grounded evidence.",
+});
+const resolved = await tool("resolve_forced_gate", { gateId: fv.gateId, claimIds: [realCheck.claimId] });
+ok(resolved.gate === "PROCEED",                 "resolve_forced_gate: grounded verified evidence → PROCEED");
+ok(resolved.verdict === "validated",            "resolve_forced_gate: verdict=validated");
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // Summary
 // ═══════════════════════════════════════════════════════════════════════════════
 child.kill();

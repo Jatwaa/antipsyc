@@ -17,6 +17,7 @@ import {
   // explicit tools
   declareAction, confirmDone, listIntents,
   pauseAndVerify,
+  detectConfirmation, forceValidation, resolveForcedGate, getForcedGate, listForcedGates,
   runVerificationChain,
   retrievalGate,
   humanAttest, getAttestation,
@@ -230,6 +231,9 @@ async function routeHttp(req, res) {
   if (pathname === "/api/conscience/confirm"  && method === "POST") return sendJson(res, 200, confirmDone(await readJson(req)));
   if (pathname === "/api/conscience/intents"  && method === "GET")  return sendJson(res, 200, listIntents());
   if (pathname === "/api/conscience/pause"    && method === "POST") return sendJson(res, 200, pauseAndVerify(await readJson(req)));
+  if (pathname === "/api/conscience/force-validation" && method === "POST") return sendJson(res, 200, forceValidation(await readJson(req)));
+  if (pathname === "/api/conscience/resolve-gate"     && method === "POST") return sendJson(res, 200, await resolveForcedGateWithStore(await readJson(req)));
+  if (pathname === "/api/conscience/gates"            && method === "GET")  return sendJson(res, 200, listForcedGates());
   if (pathname === "/api/conscience/chain"    && method === "POST") return sendJson(res, 200, await runVerificationChain(await readJson(req), verifyClaim));
   if (pathname === "/api/conscience/gate"     && method === "POST") {
     const body = await readJson(req);
@@ -348,6 +352,18 @@ async function hydratedRetrievalGate(args) {
   return retrievalGate(args, match ? [match] : []);
 }
 
+// Resolve a forced-validation gate: gather the latest evidence for each
+// supplied claimId from the ledger, then let resolveForcedGate decide.
+async function resolveForcedGateWithStore(args = {}) {
+  const ids = Array.isArray(args.claimIds) ? args.claimIds : (args.claimId ? [args.claimId] : []);
+  const evidence = Array.isArray(args.evidence) ? [...args.evidence] : [];
+  for (const id of ids) {
+    const claim = await store.getClaim(id);
+    if (claim?.evidence?.length) evidence.push(claim.evidence[0]); // newest first
+  }
+  return resolveForcedGate(args, evidence);
+}
+
 async function submitClaim(input) {
   if (!input.statement) throw new Error("statement is required");
   const validator = input.validator || input.type || "general";
@@ -380,6 +396,17 @@ async function submitClaim(input) {
   } catch { /* non-blocking */ }
 
   if (sycoWarning) claim.sycophancyWarning = sycoWarning;
+
+  // Forced validation: a confirmation sent WITHOUT a grounding validator is not
+  // accepted on the model's word — the system mints a fresh validation gate on
+  // the fly. A confirmation routed through a real validator is already
+  // validating, so it is left alone.
+  const hasConcreteValidator = !!input.validator && input.validator !== "general";
+  const confirmation = detectConfirmation(input);
+  if (confirmation && !hasConcreteValidator) {
+    claim.confirmationDetected = confirmation;
+    claim.forcedValidation = forceValidation({ ...input, statement: input.statement });
+  }
 
   return claim;
 }
@@ -664,6 +691,11 @@ async function callMcpTool(name, input) {
     list_intents:           ()   => listIntents(),
     // #2 Deliberation gate
     pause_and_verify:       args => pauseAndVerify(args),
+    // Forced validation — a confirmation mints a fresh gate on the fly
+    force_validation:       args => forceValidation(args),
+    resolve_forced_gate:    args => resolveForcedGateWithStore(args),
+    list_forced_gates:      ()   => listForcedGates(),
+    get_forced_gate:        args => getForcedGate(args.gateId) || { error: "Forced gate not found." },
     // #4 Verification chain
     run_verification_chain: args => runVerificationChain(args, verifyClaim),
     // #5/#15 Retrieval gate (F21: hydrated with evidence)
@@ -709,7 +741,8 @@ const READ_ONLY_TOOLS = new Set([
   "get_orientation", "get_templates", "get_claim", "search_evidence",
   "gate_check", "list_intents", "pause_and_verify", "retrieval_gate",
   "constitutional_check", "get_attestation", "plan_verification",
-  "semantic_challenge", "get_trace", "verify_execution", "calibration_report"
+  "semantic_challenge", "get_trace", "verify_execution", "calibration_report",
+  "force_validation", "list_forced_gates", "get_forced_gate"
 ]);
 
 // F15: a reduced surface for small models / token-sensitive clients.
@@ -717,7 +750,8 @@ const READ_ONLY_TOOLS = new Set([
 const CORE_TOOLS = new Set([
   "get_orientation", "submit_claim", "verify_claim", "verify_batch",
   "use_template", "get_templates", "gate_check", "get_claim",
-  "search_evidence", "declare_action", "confirm_done", "pause_and_verify"
+  "search_evidence", "declare_action", "confirm_done", "pause_and_verify",
+  "force_validation", "resolve_forced_gate"
 ]);
 
 function annotateTool(tool) {
@@ -835,6 +869,27 @@ function allMcpTools() {
       name: "pause_and_verify",
       description: "STOP and generate a mandatory verification checklist for a claim before asserting it. Always returns a HALT directive with specific verify_claim steps to run.",
       inputSchema: objectSchema({ claim: "string", statement: "string", validator: "string" }, [])
+    },
+    // Forced validation — a confirmation mints a fresh gate on the fly
+    {
+      name: "force_validation",
+      description: "Send a confirmation (something you believe is done/correct/successful) and the system creates a NEW validation gate on the fly to force grounded checks. A model's confirmation is not evidence. Returns a HALT with a gateId and the exact verify_claim steps to run, then resolve with resolve_forced_gate. Use whenever you are about to accept a 'done/works/passing/successful' claim.",
+      inputSchema: objectSchema({ statement: "string", claim: "string", type: "string", confirmation: "string" }, [])
+    },
+    {
+      name: "resolve_forced_gate",
+      description: "Close a forced-validation gate after running its required steps. Pass the gateId and the claimIds of the verify_claim results. Returns gate:PROCEED only when grounded verified evidence exists (and nothing is contradicted); otherwise HALT with what is still missing.",
+      inputSchema: objectSchema({ gateId: "string", claimIds: "array", claimId: "string" }, ["gateId"])
+    },
+    {
+      name: "list_forced_gates",
+      description: "List all forced-validation gates created this session, with their open/satisfied status.",
+      inputSchema: { type: "object", properties: {}, required: [] }
+    },
+    {
+      name: "get_forced_gate",
+      description: "Fetch one forced-validation gate, including its required steps and status.",
+      inputSchema: objectSchema({ gateId: "string" }, ["gateId"])
     },
     // #4 Verification chain
     {
@@ -972,6 +1027,12 @@ function buildOrientation() {
         "2. Execute each step with verify_claim independently",
         "3. Use iterative_verify if threshold not reached on first attempt",
         "4. Use consistency_vote (n=3) to confirm non-deterministic claims"
+      ],
+      for_confirmations_done_works_passing: [
+        "1. Call force_validation({ statement }) → a NEW gate is minted with required verify_claim steps. A confirmation is never accepted on your word.",
+        "2. Run every required step with verify_claim",
+        "3. Call resolve_forced_gate({ gateId, claimIds }) → gate:PROCEED only if grounded verified evidence exists",
+        "4. Assert the confirmation ONLY after PROCEED."
       ]
     },
 
@@ -1000,13 +1061,16 @@ function buildOrientation() {
         "#9  calibration_tracking    — records claimed vs actual confidence drift per validator",
         "#10 sycophancy_detection    — penalises echo/leading-question framing (−0.15 rw)",
         "#16 semantic_challenge      — warns of scope mismatch (e.g. 'secure' + filesystem.exists)",
-        "#7  constitutional_check    — warns if claim+validator violates operator-defined principles"
+        "#7  constitutional_check    — warns if claim+validator violates operator-defined principles",
+        "    forced_validation       — a confirmation (type:'confirmation' or 'done/works/passing/successful' phrasing) submitted WITHOUT a grounding validator mints a fresh gate (claim.forcedValidation) demanding real checks"
       ]
     },
 
     key_tools: {
       get_orientation:         "THIS TOOL — complete reference guide. Call first when connecting.",
       pause_and_verify:        "STOP and get a mandatory checklist before asserting any claim.",
+      force_validation:        "Send a confirmation (done/works/passing/successful) → a NEW gate is minted with required checks. Resolve with resolve_forced_gate.",
+      resolve_forced_gate:     "Close a forced-validation gate after running its steps — PROCEED only with grounded verified evidence.",
       verify_claim:            "Primary verification tool. Run an external validator; inspect verified+realityWeight.",
       use_template:            "Shortcut for common verifications. Call get_templates first.",
       get_templates:           "List all available templates with their fill fields and examples.",
