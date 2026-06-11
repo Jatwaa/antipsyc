@@ -1,6 +1,6 @@
 {
   "name": "antipsyc",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "description": "AntiPsyc — universal anti-hallucination validation MCP server with a searchable evidence UI.",
   "type": "module",
   "bin": {

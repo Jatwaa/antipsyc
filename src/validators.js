@@ -4,6 +4,7 @@ import { execFile }               from "node:child_process";
 import { promisify }              from "node:util";
 import { lookup as dnsLookup }    from "node:dns/promises";
 import { join as pathJoin }       from "node:path";
+import { createHash }             from "node:crypto";
 import vm                         from "node:vm";
 import { validateBaseDir, validateLocalPath } from "./contracts.js";
 
@@ -44,6 +45,11 @@ const validatorCatalog = {
   "git.blame_line":     { description: "Returns which commit last touched a specific line number in a file.",   required: ["path", "line"] },
   // #12: Retrieve and ground
   "retrieve_and_ground": { description: "Fetches a URL and checks whether key claim terms appear in the response body.", required: ["url", "claim"] },
+  // Roadmap: stronger grounded validators
+  "http.json_path":     { description: "Fetches a URL, parses the JSON body, and asserts a dot-notation key value.",     required: ["url", "keyPath"] },
+  "file.hash":          { description: "Computes a file's content hash (sha256 by default) and optionally compares it.", required: ["path"] },
+  "symbol.exists":      { description: "Checks whether a named symbol is declared/exported in a source file (not just present as a substring).", required: ["path", "symbol"] },
+  "glob.count":         { description: "Counts files matching a glob pattern and compares to an expected count.",         required: ["glob"] },
 };
 
 export function listValidators() {
@@ -71,6 +77,10 @@ const PERMITTED_VALIDATORS = {
   "codebase.search":     ["codebase.contains"],
   "git.history":         ["git.log_contains", "git.last_modified", "git.blame_line"],
   "retrieve.grounding":  ["retrieve_and_ground"],
+  "http.json":           ["http.json_path"],
+  "file.hash":           ["file.hash"],
+  "symbol.declaration":  ["symbol.exists"],
+  "codebase.count":      ["glob.count"],
 };
 
 export function checkValidatorPermitted(claimType, validator) {
@@ -103,6 +113,10 @@ export const VALIDATOR_TTL_SECONDS = {
   "git.last_modified":     60 * 60,
   "git.blame_line":        60 * 60,
   "retrieve_and_ground":    5 * 60,
+  "http.json_path":         5 * 60,
+  "file.hash":             30 * 60,
+  "symbol.exists":         30 * 60,
+  "glob.count":            30 * 60,
 };
 
 // ── Dispatcher ─────────────────────────────────────────────────────────────
@@ -128,6 +142,10 @@ export async function verifyWithValidator(input) {
     case "git.last_modified":  return gitLastModified(input);
     case "git.blame_line":       return gitBlameLine(input);
     case "retrieve_and_ground":  return retrieveAndGround(input);
+    case "http.json_path":       return httpJsonPath(input);
+    case "file.hash":            return fileHash(input);
+    case "symbol.exists":        return symbolExists(input);
+    case "glob.count":           return globCount(input);
     default:
       return unverifiable(validator, { error: `Unknown validator: ${validator}` });
   }
@@ -854,6 +872,142 @@ async function retrieveAndGround(input) {
       bodyLength: bodyText.length,
       threshold: minCoverage,
     }
+  };
+}
+
+// ── Roadmap: http.json_path — fetch JSON and assert a dot-path value ───────
+async function httpJsonPath(input) {
+  if (!input.url)     return failed("http.json_path", { error: "url is required" });
+  if (!input.keyPath) return failed("http.json_path", { error: "keyPath is required (e.g. \"data.status\")" });
+
+  const urlResult = normalizeHttpUrl(input.url);
+  if (!urlResult.ok) return failed("http.json_path", { url: input.url, error: urlResult.error });
+
+  const ssrf = detectPrivateHost(urlResult.url);
+  if (ssrf) return contradicted("http.json_path", 0.99, { url: urlResult.url, error: `SSRF blocked: ${ssrf}` });
+  const dnsBlock = await detectPrivateViaDNS(urlResult.url);
+  if (dnsBlock) return contradicted("http.json_path", 0.99, { url: urlResult.url, error: `SSRF DNS blocked: ${dnsBlock}` });
+  const allow = await validateOutboundUrl(urlResult.url);
+  if (!allow.ok) return failed("http.json_path", { url: urlResult.url, error: allow.error });
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), Number(process.env.ANTIPSYC_HTTP_TIMEOUT_MS || 5000));
+  let body, httpStatus;
+  try {
+    const resp = await fetch(urlResult.url, { method: input.method || "GET", redirect: "follow", signal: controller.signal });
+    httpStatus = resp.status;
+    const buf  = await resp.arrayBuffer();
+    body = new TextDecoder("utf-8", { fatal: false }).decode(new Uint8Array(buf).slice(0, 262144));
+  } catch (err) {
+    return failed("http.json_path", { url: urlResult.url, error: err.name === "AbortError" ? "Request timed out" : err.message });
+  } finally {
+    clearTimeout(timer);
+  }
+
+  let obj;
+  try { obj = JSON.parse(body); }
+  catch (e) { return failed("http.json_path", { url: urlResult.url, httpStatus, error: `Response is not valid JSON: ${e.message}` }); }
+
+  const observed = getByDotPath(obj, input.keyPath);
+  if (observed === undefined) {
+    return contradicted("http.json_path", 0.9, { url: urlResult.url, httpStatus, keyPath: input.keyPath, found: false, expected: input.expected });
+  }
+  const verified = input.expected === undefined
+    ? true
+    : String(observed) === String(input.expected) || observed === input.expected;
+  return {
+    validator: "http.json_path", verified, contradicted: input.expected !== undefined && !verified,
+    confidence: 0.85, realityWeight: 0.82,
+    result: { url: urlResult.url, httpStatus, keyPath: input.keyPath, observed, expected: input.expected, found: true }
+  };
+}
+
+// ── Roadmap: file.hash — content hash, optionally compared to expectedHash ──
+const HASH_ALGORITHMS = new Set(["sha256", "sha1", "sha512", "md5"]);
+async function fileHash(input) {
+  const algorithm = String(input.algorithm || "sha256").toLowerCase();
+  if (!HASH_ALGORITHMS.has(algorithm)) {
+    return failed("file.hash", { error: `Unsupported algorithm "${algorithm}". Use one of: ${[...HASH_ALGORITHMS].join(", ")}` });
+  }
+  const policy = validateLocalPath(input.path, "file.hash");
+  if (!policy.ok) return blocked("file.hash", policy);
+  try {
+    const buf  = await readFile(policy.path);
+    const hash = createHash(algorithm).update(buf).digest("hex");
+    if (input.expectedHash) {
+      const expected = String(input.expectedHash).trim().toLowerCase();
+      const verified = hash === expected;
+      return {
+        validator: "file.hash", verified, contradicted: !verified,
+        confidence: 0.99, realityWeight: 0.95,
+        result: { path: policy.path, algorithm, hash, expectedHash: expected, matched: verified, bytes: buf.length }
+      };
+    }
+    // No expected hash — report the observed hash as a grounded fact.
+    return accepted("file.hash", 0.95, { path: policy.path, algorithm, hash, bytes: buf.length });
+  } catch (error) {
+    return failed("file.hash", { path: policy.path, error: error.message });
+  }
+}
+
+// ── Roadmap: symbol.exists — symbol is DECLARED/exported (not just present) ─
+function symbolDeclarationRegex(symbol) {
+  const s = String(symbol).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const patterns = [
+    `\\bfunction\\s+${s}\\b`,
+    `\\bclass\\s+${s}\\b`,
+    `\\b(?:const|let|var)\\s+${s}\\b`,
+    `\\bdef\\s+${s}\\b`,                                   // python
+    `\\bexport\\s+(?:default\\s+)?(?:async\\s+)?(?:function|class|const|let|var)\\s+${s}\\b`,
+    `\\bexport\\s*\\{[^}]*\\b${s}\\b[^}]*\\}`,             // export { X }
+    `\\b${s}\\s*[:=]\\s*(?:async\\s+)?(?:function\\b|\\([^)]*\\)\\s*=>)`, // X = function / X = (...) =>
+  ];
+  return new RegExp(patterns.join("|"));
+}
+async function symbolExists(input) {
+  if (!input.path)   return failed("symbol.exists", { error: "path is required" });
+  if (!input.symbol) return failed("symbol.exists", { error: "symbol is required" });
+  if (!/^[A-Za-z_$][\w$]*$/.test(String(input.symbol))) {
+    return failed("symbol.exists", { error: "symbol must be a valid identifier" });
+  }
+  const policy = validateLocalPath(input.path, "symbol.exists");
+  if (!policy.ok) return blocked("symbol.exists", policy);
+  try {
+    const text  = await readFile(policy.path, "utf8");
+    const regex = symbolDeclarationRegex(input.symbol);
+    const declared = vm.runInNewContext("re.test(text)", { re: regex, text }, { timeout: 500 });
+    return {
+      validator: "symbol.exists", verified: declared, contradicted: !declared,
+      confidence: 0.9, realityWeight: 0.88,
+      result: { path: policy.path, symbol: input.symbol, declared }
+    };
+  } catch (error) {
+    return failed("symbol.exists", { path: policy.path, symbol: input.symbol, error: error.message });
+  }
+}
+
+// ── Roadmap: glob.count — number of files matching a glob vs expected ───────
+async function globCount(input) {
+  if (!input.glob) return failed("glob.count", { error: "glob is required" });
+  const basePolicy = validateBaseDir(input.baseDir || process.cwd());
+  if (!basePolicy.ok) return blocked("glob.count", basePolicy);
+  let files;
+  try { files = await findFilesMatchingGlob(basePolicy.path, input.glob); }
+  catch (error) { return failed("glob.count", { error: error.message }); }
+
+  const count = files.length;
+  if (input.expectedCount === undefined || input.expectedCount === null) {
+    return accepted("glob.count", 0.93, { glob: input.glob, baseDir: basePolicy.path, count });
+  }
+  const expected  = Number(input.expectedCount);
+  const rawTol    = Number(input.tolerance ?? 0);
+  const tolerance = Number.isFinite(rawTol) && rawTol >= 0 ? rawTol : 0;
+  const verified  = Math.abs(count - expected) <= tolerance;
+  return {
+    validator: "glob.count", verified, contradicted: !verified,
+    confidence: 0.93, realityWeight: 0.9,
+    result: { glob: input.glob, baseDir: basePolicy.path, count, expected, tolerance,
+              sample: files.slice(0, 10).map(f => f.replace(/\\/g, "/")) }
   };
 }
 

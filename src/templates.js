@@ -232,9 +232,10 @@ const GATE_BANDS = [
  * @param {number}       [threshold=0.40]  Minimum rw for a "caveat" signal
  * @param {boolean|null} [verified=null]   evidence.verified
  * @param {boolean|null} [contradicted=null] evidence.contradicted
+ * @param {string|null}  [status=null]     evidence.status (so stale evidence cannot gate as verified)
  * @returns {{ gate, label, realityWeight, threshold, suggestion }}
  */
-export function computeGate(realityWeight, threshold = 0.40, verified = null, contradicted = null) {
+export function computeGate(realityWeight, threshold = 0.40, verified = null, contradicted = null, status = null) {
   // Clamp realityWeight to [0, 1] — reject fabricated out-of-range values
   const raw = Number(realityWeight ?? 0);
   const rw  = Number.isFinite(raw) ? Math.max(0, Math.min(1, raw)) : 0;
@@ -263,6 +264,24 @@ export function computeGate(realityWeight, threshold = 0.40, verified = null, co
       suggestion:
         "Evidence flags (verified/contradicted) were not provided. " +
         "Pass the verified and contradicted fields from your evidence record before asserting."
+    };
+  }
+
+  // STALE evidence can NEVER assert confidently, regardless of decayed rw.
+  // Decay is gradual, so a record one minute past its TTL still carries a high
+  // realityWeight — without this, the gate would return "verified" for hours
+  // after expiry. Stale evidence caps at "caveat" with a re-verify directive,
+  // and falls through to "suppress" if its rw has already decayed below caveat.
+  if (status === "stale") {
+    const band = rw >= th ? GATE_BANDS[1] : GATE_BANDS[2];
+    return {
+      ...band,
+      realityWeight: rw,
+      threshold: th,
+      stale: true,
+      suggestion:
+        "Evidence has EXPIRED (stale) — the world may have changed since it was checked. " +
+        "Re-run the validator to refresh before asserting; do not present a stale observation as current fact."
     };
   }
 

@@ -98,6 +98,23 @@ const VALIDATOR_PROFILES = {
     status: "observed",
     claimTypes: ["retrieve.grounding"],
     requiredSlots: ["claim"]
+  },
+  // Roadmap: stronger grounded validators (all read real external state).
+  "http.json_path": {
+    status: "observed",
+    claimTypes: ["http.json"]
+  },
+  "file.hash": {
+    status: "observed",
+    claimTypes: ["file.hash"]
+  },
+  "symbol.exists": {
+    status: "observed",
+    claimTypes: ["symbol.declaration"]
+  },
+  "glob.count": {
+    status: "observed",
+    claimTypes: ["codebase.count"]
   }
 };
 
@@ -325,7 +342,7 @@ function statementRelevance(statement, input, validator, profile, evidence) {
 // F5a: remove the verified artifact's own identifiers from the statement
 // before scanning for qualitative scope words.
 function scrubArtifactTerms(text, input) {
-  const terms = [input.path, basename(input.path), input.glob, input.url, input.keyPath, input.branch]
+  const terms = [input.path, basename(input.path), input.glob, input.url, input.keyPath, input.branch, input.symbol]
     .map((t) => String(t || "").toLowerCase().replace(/\\/g, "/"))
     .filter((t) => t.length >= 3);
   let out = text.replace(/\\/g, "/");
@@ -369,6 +386,10 @@ function unsupportedScopeReason(text, validator) {
     "git.last_modified": [...BASE_PHYSICAL, ...QUALITATIVE_SCOPE_WORDS],
     "git.blame_line":    [...BASE_PHYSICAL, ...QUALITATIVE_SCOPE_WORDS],
     "git.log_contains":  [...BASE_PHYSICAL, ...QUALITATIVE_SCOPE_WORDS],
+    "file.hash":         [...BASE_PHYSICAL, ...QUALITATIVE_SCOPE_WORDS],
+    "symbol.exists":     [...BASE_PHYSICAL, ...QUALITATIVE_SCOPE_WORDS],
+    "glob.count":        [...BASE_PHYSICAL, ...QUALITATIVE_SCOPE_WORDS],
+    "http.json_path":    [...BASE_PHYSICAL, ...QUALITATIVE_SCOPE_WORDS],
     "math.evaluate":     REAL_WORLD_WORDS
   };
   const unsupported = scopeWordsByValidator[validator] || [];
@@ -389,6 +410,8 @@ function extractAssertionSlots(statement, input, validator) {
     case "git.contains":
     case "git.last_modified":
     case "git.blame_line":
+    case "file.hash":
+    case "symbol.exists":
       return {
         path: canonicalPathLike(input.path),
         pathMentioned: mentionsPath(text, input.path),
@@ -406,6 +429,14 @@ function extractAssertionSlots(statement, input, validator) {
         url: normalizeUrl(input.url),
         expectedStatus: normalizeComparable(input.expectedStatus || 200)
       };
+    case "http.json_path":
+      return {
+        url: normalizeUrl(input.url),
+        keyPath: input.keyPath,
+        expected: normalizeComparable(input.expected)
+      };
+    case "glob.count":
+      return { glob: input.glob, expectedCount: normalizeComparable(input.expectedCount) };
     case "text.contains":
       return { contains: String(input.contains || "") };
     case "codebase.contains":
@@ -440,6 +471,8 @@ function extractObservedSlots(evidence, validator) {
     case "git.contains":
     case "git.last_modified":
     case "git.blame_line":
+    case "file.hash":
+    case "symbol.exists":
       return {
         path: canonicalPathLike(result.path),
         contains: result.contains,
@@ -456,6 +489,14 @@ function extractObservedSlots(evidence, validator) {
         url: normalizeUrl(result.url),
         expectedStatus: normalizeComparable(result.expectedStatus)
       };
+    case "http.json_path":
+      return {
+        url: normalizeUrl(result.url),
+        keyPath: result.keyPath,
+        expected: normalizeComparable(result.expected)
+      };
+    case "glob.count":
+      return { glob: result.glob, expectedCount: normalizeComparable(result.expected) };
     case "text.contains":
       return { contains: result.contains };
     case "codebase.contains":
@@ -487,12 +528,12 @@ function compareSlots(assertion, observed, validator, requiredSlots) {
       return { ok: false, reason: `Claim assertion slot "${slot}" does not match observed evidence.` };
     }
   }
-  if (["filesystem.exists", "filesystem.stat", "file.contains", "file.matches", "json.valid", "json.path"].includes(validator)) {
+  if (["filesystem.exists", "filesystem.stat", "file.contains", "file.matches", "json.valid", "json.path", "file.hash", "symbol.exists"].includes(validator)) {
     if (!assertion.pathMentioned) {
       return { ok: false, reason: "Filesystem-style claims must mention the exact file path or basename being verified." };
     }
   }
-  if (validator === "http.fetch" && !assertion.url) {
+  if ((validator === "http.fetch" || validator === "http.json_path") && !assertion.url) {
     return { ok: false, reason: "HTTP claims must include the target URL in the assertion contract." };
   }
   return { ok: true, strong: requiredSlots.length > 0, reason: "structured claim contract matched observed evidence" };
@@ -512,7 +553,11 @@ function payloadRelevanceTerms(input, validator) {
     case "git.last_modified":
     case "git.blame_line":
       return [input.path, basename(input.path), input.contains, input.pattern, input.keyPath];
+    case "file.hash": return [input.path, basename(input.path), input.expectedHash];
+    case "symbol.exists": return [input.path, basename(input.path), input.symbol];
     case "http.fetch": return [input.url, input.expectedStatus];
+    case "http.json_path": return [input.url, input.keyPath, input.expected];
+    case "glob.count": return [input.glob, input.expectedCount];
     case "text.contains": return [input.contains];
     case "codebase.contains": return [input.glob, input.contains, input.pattern];
     case "git.log_contains": return [input.message];

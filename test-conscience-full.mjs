@@ -83,8 +83,13 @@ async function tool(name, args = {}) {
   return JSON.parse(res.content[0].text);
 }
 
-// ── Minimal HTTP server for retrieve_and_ground tests ─────────────────────
+// ── Minimal HTTP server for retrieve_and_ground / http.json_path tests ─────
 const httpSrv = createServer((req, res) => {
+  if (req.url === "/json") {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ status: "ok", data: { version: "1.2.3" } }));
+    return;
+  }
   res.writeHead(200, { "content-type": "text/plain" });
   res.end("epistemic conscience layer anti-hallucination verify claims");
 });
@@ -881,6 +886,59 @@ ok(confClaim.confirmationDetected?.signal === "explicit", "submit_claim: explici
 // A normal grounded (non-confirmation) claim does NOT get a forced gate
 const groundedClaim = await tool("submit_claim", { statement: "package.json exists at the project root", type: "filesystem.exists" });
 ok(!groundedClaim.forcedValidation,             "submit_claim: grounded non-confirmation → no forced gate");
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 24.  Roadmap fixes — new validators, expectAbsent, stale gate, response audit
+// ═══════════════════════════════════════════════════════════════════════════════
+section("24 — roadmap fixes (new validators / expectAbsent / stale / audit)");
+
+// file.hash — grounded content hash, and comparison
+const hash1 = await tool("verify_claim", { statement: "package.json has a content hash", validator: "file.hash", path: join(__dirname, "package.json") });
+ok(hash1.verified === true && /^[0-9a-f]{64}$/.test(hash1.result?.hash || ""), "file.hash: returns a sha256 of package.json");
+const hash2 = await tool("verify_claim", { statement: "package.json hash equals deadbeef", validator: "file.hash", path: join(__dirname, "package.json"), expectedHash: "deadbeef" });
+ok(hash2.contradicted === true, "file.hash: wrong expectedHash → contradicted");
+
+// symbol.exists — declaration, not substring
+const sym1 = await tool("verify_claim", { statement: "computeGate is declared in src/templates.js", validator: "symbol.exists", path: join(__dirname, "src", "templates.js"), symbol: "computeGate" });
+ok(sym1.verified === true, "symbol.exists: declared export → verified");
+const sym2 = await tool("verify_claim", { statement: "noSuchSymbol is declared in src/templates.js", validator: "symbol.exists", path: join(__dirname, "src", "templates.js"), symbol: "noSuchSymbol" });
+ok(sym2.contradicted === true, "symbol.exists: absent symbol → contradicted");
+
+// glob.count — file counting with expected
+const gc1 = await tool("verify_claim", { statement: "the glob src/**/*.js matches files", validator: "glob.count", glob: "src/**/*.js", baseDir: __dirname });
+ok(gc1.verified === true && gc1.result?.count >= 5, "glob.count: counts source files");
+const gc2 = await tool("verify_claim", { statement: "the glob src/**/*.js matches 999 files", validator: "glob.count", glob: "src/**/*.js", baseDir: __dirname, expectedCount: 999 });
+ok(gc2.contradicted === true, "glob.count: wrong expectedCount → contradicted");
+
+// http.json_path — assert on the JSON body, not just status
+const jp1 = await tool("verify_claim", { statement: `the API at http://127.0.0.1:${HTTP_PORT}/json returns data.version 1.2.3`, validator: "http.json_path", url: `http://127.0.0.1:${HTTP_PORT}/json`, keyPath: "data.version", expected: "1.2.3" });
+ok(jp1.verified === true, "http.json_path: matching body value → verified", JSON.stringify(jp1.result || jp1));
+const jp2 = await tool("verify_claim", { statement: `the API at http://127.0.0.1:${HTTP_PORT}/json returns data.version 9.9.9`, validator: "http.json_path", url: `http://127.0.0.1:${HTTP_PORT}/json`, keyPath: "data.version", expected: "9.9.9" });
+ok(jp2.contradicted === true, "http.json_path: wrong body value → contradicted");
+
+// expectAbsent — first-class negative claim on verify_claim
+const abs1 = await tool("verify_claim", { statement: "package.json does not contain 'express'", validator: "file.contains", path: join(__dirname, "package.json"), contains: "express", expectAbsent: true });
+ok(abs1.verified === true, "expectAbsent: absent substring → verified (negative claim)");
+const abs2 = await tool("verify_claim", { statement: "package.json does not contain 'antipsyc'", validator: "file.contains", path: join(__dirname, "package.json"), contains: "antipsyc", expectAbsent: true });
+ok(abs2.contradicted === true, "expectAbsent: present substring → contradicted");
+
+// stale-gate fix — stale evidence can never gate as 'verified'
+const gateStale = await tool("gate_check", { realityWeight: 0.95, verified: true, contradicted: false, status: "stale" });
+ok(gateStale.gate === "caveat" && gateStale.stale === true, "gate_check: stale verified rw=0.95 → caveat (not verified)");
+
+// extract_claims — deterministic claim extraction
+const ex = await tool("extract_claims", { text: "I created package.json and the value 2 + 2 = 4." });
+ok(Array.isArray(ex.claims) && ex.claims.some(c => c.validator === "filesystem.exists" && /package\.json/.test(c.path)), "extract_claims: finds the file claim");
+ok(ex.claims.some(c => c.validator === "math.evaluate"), "extract_claims: finds the arithmetic claim");
+
+// audit_response — REVISE when a draft contains a false claim
+const auditBad = await tool("audit_response", { text: "The file src/ghost-audit-xyz.js exists and 2 + 2 = 5." });
+ok(auditBad.verdict === "REVISE", "audit_response: draft with false claims → REVISE");
+ok(auditBad.counts?.contradicted >= 1, "audit_response: reports contradicted claims");
+
+// audit_response — OK when every claim is grounded
+const auditGood = await tool("audit_response", { text: "The file package.json exists and 2 + 2 = 4." });
+ok(auditGood.verdict === "OK", "audit_response: all-true draft → OK");
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Summary

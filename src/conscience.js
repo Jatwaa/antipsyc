@@ -611,6 +611,129 @@ export function resolveForcedGate(input = {}, evidence = []) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// Response-level linting — turn free text into checkable claims (roadmap #1)
+//
+// extract_claims is deterministic (no LLM): it sweeps a draft for the
+// assertions a validator can actually check and emits ready-to-run verify_claim
+// payloads. audit_response runs them and returns a send/REVISE verdict. This
+// makes grounding the default path — the model pipes its own prose through the
+// gate instead of having to think of each claim.
+// ─────────────────────────────────────────────────────────────────────────
+
+const SYMBOL_STOPWORDS = new Set([
+  "the", "and", "is", "are", "was", "were", "a", "an", "of", "to", "in", "on",
+  "for", "with", "that", "this", "it", "as", "from", "function", "class",
+  "const", "let", "var", "export", "exported", "exports", "method", "default",
+]);
+
+function extractSymbols(text) {
+  const out = new Set();
+  const rx = /\b(?:export(?:ed|s)?|function|class|const|method)\s+([A-Za-z_$][\w$]*)|\b([A-Za-z_$][\w$]*)\s+(?:is\s+)?(?:export(?:ed)?|function)\b/gi;
+  for (const m of text.matchAll(rx)) {
+    const sym = m[1] || m[2];
+    if (sym && sym.length >= 2 && !SYMBOL_STOPWORDS.has(sym.toLowerCase())) out.add(sym);
+  }
+  return [...out];
+}
+
+// Deterministically extract checkable claims from free text, each as a
+// ready-to-run verify_claim payload. Pairing is sentence-scoped so a path and
+// the thing asserted about it stay together.
+export function extractClaims(input = {}) {
+  const text = String(input.text || input.draft || input.statement || "");
+  if (!text.trim()) return { text: "", claimCount: 0, claims: [] };
+
+  const claims = [];
+  const seen = new Set();
+  const add = (c) => {
+    const key = `${c.validator}|${(c.path || c.url || c.glob || "")}|${(c.contains || c.symbol || c.expected || c.expression || "")}`.toLowerCase();
+    if (!seen.has(key)) { seen.add(key); claims.push(c); }
+  };
+
+  const sentences = text.split(/(?<=[.!?])\s+|\n+/).map(s => s.trim()).filter(Boolean);
+  for (const s of sentences) {
+    const paths  = [...new Set(extractFilePaths(s))].slice(0, 6);
+    const urls   = [...new Set(extractUrls(s))].slice(0, 4);
+    const quoted = [...new Set(extractQuotedStrings(s))];
+    const symbols = extractSymbols(s);
+
+    for (const p of paths) {
+      add({ statement: `${p} exists`, validator: "filesystem.exists", path: p });
+      for (const q of quoted.slice(0, 4)) {
+        add({ statement: `${p} contains "${q}"`, validator: "file.contains", path: p, contains: q });
+      }
+      for (const sym of symbols.slice(0, 4)) {
+        add({ statement: `${sym} is declared in ${p}`, validator: "symbol.exists", path: p, symbol: sym });
+      }
+    }
+    for (const u of urls) {
+      add({ statement: `${u} responds with HTTP 200`, validator: "http.fetch", url: u, expectedStatus: 200 });
+    }
+
+    // package.json version ("version 2.1.0", "bumped to v2.1.0")
+    const ver = s.match(/\bv(?:ersion)?\.?\s*(?:to\s+|=\s*)?["']?(\d+\.\d+\.\d+)["']?/i) || s.match(/\bv(\d+\.\d+\.\d+)\b/);
+    if (ver) {
+      add({ statement: `package.json version is ${ver[1]}`, validator: "json.path", path: "package.json", keyPath: "version", expected: ver[1] });
+    }
+
+    // arithmetic ("2 + 2 = 4", "10 * 3 equals 30")
+    for (const m of s.matchAll(/(\d+(?:\.\d+)?(?:\s*[-+*/]\s*\d+(?:\.\d+)?)+)\s*(?:=|==|equals?|is)\s*(\d+(?:\.\d+)?)/gi)) {
+      add({ statement: `${m[1]} = ${m[2]}`, validator: "math.evaluate", expression: m[1].replace(/\s+/g, ""), expected: Number(m[2]) });
+    }
+  }
+
+  return { text: text.slice(0, 400), claimCount: claims.length, claims };
+}
+
+// Audit a whole draft response: extract its checkable claims, verify each, and
+// return a send/REVISE verdict. verifyFn is the server's verifyClaim.
+export async function auditResponse(input, verifyFn) {
+  const { claims } = extractClaims(input);
+  if (!claims.length) {
+    return {
+      tactic:  "audit_response",
+      verdict: "NO_CHECKABLE_CLAIMS",
+      checked: 0,
+      message: "No externally-checkable claims were found in the text. Nothing to verify — but the absence of checkable claims is not a guarantee of correctness. Prefer making concrete, checkable assertions.",
+    };
+  }
+
+  const results = await Promise.all(claims.map(async (c) => {
+    let ev;
+    try { const r = await verifyFn({ ...c }); ev = r.evidence || r; }
+    catch (e) { ev = { verified: false, contradicted: false, status: "failed", realityWeight: 0, result: { error: e.message } }; }
+    return {
+      statement:     c.statement,
+      validator:     c.validator,
+      verified:      ev.verified === true && ev.status === "verified",
+      contradicted:  ev.contradicted === true,
+      status:        ev.status,
+      realityWeight: ev.realityWeight,
+      gate:          ev.gate?.gate || null,
+    };
+  }));
+
+  const grounded     = results.filter(r => r.verified && !r.contradicted);
+  const contradicted = results.filter(r => r.contradicted);
+  const ungrounded   = results.filter(r => !r.verified && !r.contradicted);
+  const verdict      = (contradicted.length || ungrounded.length) ? "REVISE" : "OK";
+
+  return {
+    tactic:  "audit_response",
+    verdict,
+    checked: results.length,
+    counts:  { grounded: grounded.length, contradicted: contradicted.length, ungrounded: ungrounded.length },
+    contradicted,
+    ungrounded,
+    grounded,
+    directive: verdict === "OK"
+      ? "Every checkable claim in the draft is grounded by fresh verified evidence. Safe to send."
+      : `Do NOT send as-is. ${contradicted.length} contradicted and ${ungrounded.length} unverified claim(s). Remove them, correct them, or qualify them as unverified before sending.`,
+    do_not_assert: verdict !== "OK",
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // #3  Contradiction detection (auto-applied hook)
 // ─────────────────────────────────────────────────────────────────────────
 

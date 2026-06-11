@@ -18,6 +18,7 @@ import {
   declareAction, confirmDone, listIntents,
   pauseAndVerify,
   detectConfirmation, forceValidation, resolveForcedGate, getForcedGate, listForcedGates,
+  extractClaims, auditResponse,
   runVerificationChain,
   retrievalGate,
   humanAttest, getAttestation,
@@ -231,6 +232,8 @@ async function routeHttp(req, res) {
   if (pathname === "/api/conscience/confirm"  && method === "POST") return sendJson(res, 200, confirmDone(await readJson(req)));
   if (pathname === "/api/conscience/intents"  && method === "GET")  return sendJson(res, 200, listIntents());
   if (pathname === "/api/conscience/pause"    && method === "POST") return sendJson(res, 200, pauseAndVerify(await readJson(req)));
+  if (pathname === "/api/extract"             && method === "POST") return sendJson(res, 200, extractClaims(await readJson(req)));
+  if (pathname === "/api/audit"               && method === "POST") return sendJson(res, 200, await auditResponse(await readJson(req), verifyClaim));
   if (pathname === "/api/conscience/force-validation" && method === "POST") return sendJson(res, 200, forceValidation(await readJson(req)));
   if (pathname === "/api/conscience/resolve-gate"     && method === "POST") return sendJson(res, 200, await resolveForcedGateWithStore(await readJson(req)));
   if (pathname === "/api/conscience/gates"            && method === "GET")  return sendJson(res, 200, listForcedGates());
@@ -262,9 +265,29 @@ async function routeHttp(req, res) {
 // remains available for re-checking cached/ledger claims.
 function withGate(record) {
   if (record && typeof record === "object") {
-    record.gate = computeGate(record.realityWeight, undefined, record.verified, record.contradicted);
+    record.gate = computeGate(record.realityWeight, undefined, record.verified, record.contradicted, record.status);
   }
   return record;
+}
+
+// First-class expectAbsent (roadmap #6): when a claim asserts a target is
+// ABSENT, flip verified/contradicted so "absent = verified". Same semantics as
+// the no-dependency template, now usable on verify_claim directly. e.g.
+// verify_claim({ validator:"file.contains", path:"package.json",
+//   contains:"express", expectAbsent:true }) verifies that express is NOT present.
+function applyExpectAbsent(rawEvidence, expectAbsent) {
+  if (!expectAbsent) return rawEvidence;
+  if (!(rawEvidence.verified || rawEvidence.contradicted)) return rawEvidence; // failed/blocked — nothing to flip
+  return {
+    ...rawEvidence,
+    verified:     rawEvidence.contradicted,
+    contradicted: rawEvidence.verified,
+    result: {
+      ...rawEvidence.result,
+      expectAbsent: true,
+      note: "verified/contradicted flipped: verified = target is absent",
+    },
+  };
 }
 
 // P2 (F2): ledger-backed gate. When a claimId is supplied, the gate reads
@@ -285,7 +308,7 @@ async function gateCheck(args = {}) {
       };
     }
     return {
-      ...computeGate(latest.realityWeight, args.threshold, latest.verified, latest.contradicted),
+      ...computeGate(latest.realityWeight, args.threshold, latest.verified, latest.contradicted, latest.status),
       attested: true,
       claimId: claim.id,
       evidenceId: latest.id,
@@ -295,7 +318,7 @@ async function gateCheck(args = {}) {
     };
   }
   return {
-    ...computeGate(args.realityWeight, args.threshold, args.verified, args.contradicted),
+    ...computeGate(args.realityWeight, args.threshold, args.verified, args.contradicted, args.status),
     attested: false,
     note: "Gate computed from caller-supplied values (unattested). Pass claimId to compute from the evidence ledger instead."
   };
@@ -450,7 +473,10 @@ async function verifyClaim(input) {
   // #6 Destructive double-verify — warn if first evidence, require second for promotion
   const destructive = isDestructiveClaim(claim.statement);
 
-  const rawEvidence = await verifyWithValidator({ ...input, type: claim.type });
+  const rawEvidence = applyExpectAbsent(
+    await verifyWithValidator({ ...input, type: claim.type }),
+    input.expectAbsent === true
+  );
 
   // #9 Calibration recording
   recordCalibration(validator, input.claimedConfidence ?? claim.claimedConfidence, rawEvidence.realityWeight);
@@ -521,20 +547,11 @@ async function verifyTemplate(input) {
     return withGate(await store.appendEvidence(claim.id, ev));
   }
 
-  const rawEvidence = await verifyWithValidator({ ...validatorArgs, type: claim.type });
-  const semanticRaw = expectAbsent && (rawEvidence.verified || rawEvidence.contradicted)
-    ? {
-        ...rawEvidence,
-        verified: rawEvidence.contradicted,
-        contradicted: rawEvidence.verified,
-        result: {
-          ...rawEvidence.result,
-          expectAbsent: true,
-          note: "verified/contradicted flipped before persistence: verified = target is absent"
-        }
-      }
-    : rawEvidence;
-  const evidence = assessClaimEvidence({ claim, input: { ...validatorArgs, statement }, validator, evidence: semanticRaw });
+  const rawEvidence = applyExpectAbsent(
+    await verifyWithValidator({ ...validatorArgs, type: claim.type }),
+    expectAbsent
+  );
+  const evidence = assessClaimEvidence({ claim, input: { ...validatorArgs, statement }, validator, evidence: rawEvidence });
   return withGate(await store.appendEvidence(claim.id, evidence));
 }
 
@@ -691,6 +708,9 @@ async function callMcpTool(name, input) {
     list_intents:           ()   => listIntents(),
     // #2 Deliberation gate
     pause_and_verify:       args => pauseAndVerify(args),
+    // Response-level linting — turn a draft into checkable claims and audit it
+    extract_claims:         args => extractClaims(args),
+    audit_response:         args => auditResponse(args, verifyClaim),
     // Forced validation — a confirmation mints a fresh gate on the fly
     force_validation:       args => forceValidation(args),
     resolve_forced_gate:    args => resolveForcedGateWithStore(args),
@@ -742,7 +762,7 @@ const READ_ONLY_TOOLS = new Set([
   "gate_check", "list_intents", "pause_and_verify", "retrieval_gate",
   "constitutional_check", "get_attestation", "plan_verification",
   "semantic_challenge", "get_trace", "verify_execution", "calibration_report",
-  "force_validation", "list_forced_gates", "get_forced_gate"
+  "force_validation", "list_forced_gates", "get_forced_gate", "extract_claims"
 ]);
 
 // F15: a reduced surface for small models / token-sensitive clients.
@@ -751,7 +771,7 @@ const CORE_TOOLS = new Set([
   "get_orientation", "submit_claim", "verify_claim", "verify_batch",
   "use_template", "get_templates", "gate_check", "get_claim",
   "search_evidence", "declare_action", "confirm_done", "pause_and_verify",
-  "force_validation", "resolve_forced_gate"
+  "force_validation", "resolve_forced_gate", "extract_claims", "audit_response"
 ]);
 
 function annotateTool(tool) {
@@ -804,7 +824,11 @@ function allMcpTools() {
         glob: "string", baseDir: "string",
         // G8: git history
         message: "string", since: "string", line: "number",
-        repo: "string", caseSensitive: "boolean"
+        repo: "string", caseSensitive: "boolean",
+        // roadmap: negative claims + new validators
+        expectAbsent: "boolean",
+        symbol: "string", expectedHash: "string", algorithm: "string",
+        expectedCount: "number", tolerance: "number"
       }, [])
     },
     {
@@ -869,6 +893,17 @@ function allMcpTools() {
       name: "pause_and_verify",
       description: "STOP and generate a mandatory verification checklist for a claim before asserting it. Always returns a HALT directive with specific verify_claim steps to run.",
       inputSchema: objectSchema({ claim: "string", statement: "string", validator: "string" }, [])
+    },
+    // Response-level linting
+    {
+      name: "extract_claims",
+      description: "Turn a draft answer into checkable claims. Deterministically sweeps the text for assertions a validator can prove (files, content, exported symbols, URLs, package version, arithmetic) and returns ready-to-run verify_claim payloads. No LLM, no side effects.",
+      inputSchema: objectSchema({ text: "string" }, ["text"])
+    },
+    {
+      name: "audit_response",
+      description: "Audit a whole draft before sending it. Extracts every checkable claim, verifies each with a real validator, and returns verdict OK or REVISE with the grounded / contradicted / unverified breakdown. Call this on your final message — if verdict is REVISE, fix the flagged claims before sending.",
+      inputSchema: objectSchema({ text: "string" }, ["text"])
     },
     // Forced validation — a confirmation mints a fresh gate on the fly
     {
@@ -1033,6 +1068,11 @@ function buildOrientation() {
         "2. Run every required step with verify_claim",
         "3. Call resolve_forced_gate({ gateId, claimIds }) → gate:PROCEED only if grounded verified evidence exists",
         "4. Assert the confirmation ONLY after PROCEED."
+      ],
+      before_you_send_a_response: [
+        "1. Call audit_response({ text: <your draft> }) → it extracts every checkable claim, verifies each, and returns OK or REVISE.",
+        "2. If verdict=REVISE, remove/correct/qualify the contradicted and unverified claims it lists.",
+        "3. Re-audit until OK, then send. (Use extract_claims first if you only want the checkable-claim list.)"
       ]
     },
 
@@ -1069,6 +1109,8 @@ function buildOrientation() {
     key_tools: {
       get_orientation:         "THIS TOOL — complete reference guide. Call first when connecting.",
       pause_and_verify:        "STOP and get a mandatory checklist before asserting any claim.",
+      audit_response:          "Lint a whole draft before sending — extracts every checkable claim, verifies each, returns OK or REVISE.",
+      extract_claims:          "Turn free text into ready-to-run verify_claim payloads (deterministic, no side effects).",
       force_validation:        "Send a confirmation (done/works/passing/successful) → a NEW gate is minted with required checks. Resolve with resolve_forced_gate.",
       resolve_forced_gate:     "Close a forced-validation gate after running its steps — PROCEED only with grounded verified evidence.",
       verify_claim:            "Primary verification tool. Run an external validator; inspect verified+realityWeight.",

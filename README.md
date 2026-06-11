@@ -128,6 +128,15 @@ Each validator corresponds to a grounded check against external state. The claim
 | Validator | Claim Type | What It Checks |
 |-----------|-----------|----------------|
 | `http.fetch` | `http.reachability` or `http.response` | Makes an HTTP/HTTPS request and compares the response status code. SSRF-protected: loopback, RFC-1918, link-local, and IPv6 private addresses are blocked at both the hostname and DNS-resolution levels. Redirects are followed up to a configurable limit, with SSRF policy re-checked at each hop. |
+| `http.json_path` | `http.json` | Fetches a URL, parses the JSON body, and asserts a dot-notation key value (e.g. `data.status`). Status 200 alone says nothing about the body; this checks the actual payload. Same SSRF protection as `http.fetch`. |
+
+### Content Integrity & Structure
+
+| Validator | Claim Type | What It Checks |
+|-----------|-----------|----------------|
+| `file.hash` | `file.hash` | Computes a file's content hash (sha256 by default; sha1/sha512/md5 supported) and, when `expectedHash` is given, compares it. Proves "I did not modify X" and exact-content claims. |
+| `symbol.exists` | `symbol.declaration` | Checks whether a named symbol is **declared/exported** in a source file (`export function X`, `class X`, `const X =`, `def X`…) — not merely present as a substring, which `file.contains` would match inside a comment or a usage. |
+| `glob.count` | `codebase.count` | Counts the files matching a glob pattern and compares to an `expectedCount` (with optional `tolerance`). Catches fabricated quantities ("there are 12 components"). |
 
 ### Text (Low-Confidence)
 
@@ -232,6 +241,36 @@ POST /api/conscience/force-validation
 POST /api/conscience/resolve-gate
 { "gateId": "gate_…", "claimIds": ["claim_…"] }
 // → { gate: "PROCEED", verdict: "validated" }  (only with grounded evidence)
+```
+
+---
+
+## Response Auditing — Lint a Whole Draft Before You Send It
+
+Every other mechanism is opt-in per claim. **`audit_response`** closes that gap: give it a draft answer and it extracts every checkable assertion, verifies each with a real validator, and returns a single verdict.
+
+```json
+POST /api/audit
+{ "text": "I created src/auth.js with a validateToken export and bumped the version to 2.1.0." }
+→ {
+  "verdict": "REVISE",
+  "checked": 3,
+  "counts": { "grounded": 1, "contradicted": 1, "ungrounded": 1 },
+  "contradicted": [ { "statement": "validateToken is declared in src/auth.js", … } ],
+  "directive": "Do NOT send as-is. 1 contradicted and 1 unverified claim(s). …"
+}
+```
+
+The extractor (`extract_claims` / `POST /api/extract`) is deterministic — no second model in the loop. It sweeps the text, sentence by sentence, for files, file content, exported symbols, URLs, the package version, and arithmetic, and emits ready-to-run `verify_claim` payloads. The recommended habit for any agent is **audit before you answer**: re-audit until `verdict: "OK"`, then send.
+
+## Negative Claims — `expectAbsent`
+
+Any `verify_claim` call accepts `expectAbsent: true`, which flips verified/contradicted so that **absence is success**. For example, to prove a dependency is *not* present:
+
+```json
+POST /api/verify
+{ "validator": "file.contains", "path": "package.json", "contains": "express", "expectAbsent": true }
+// → verified = true  (express is absent)
 ```
 
 ---
@@ -502,6 +541,8 @@ Using `text.contains` with caller-supplied text always produces `status: "syntac
 ### When evidence is stale
 
 A previously verified claim that has passed its TTL will show `status: "stale"` and a decayed `realityWeight`. Re-run the same validator to refresh it. The old evidence records remain in the ledger.
+
+Because decay is gradual, stale evidence can still carry a high realityWeight for a while after expiry — so the gate is **status-aware**: stale evidence can never return `verified`. It caps at `caveat` (with a re-verify directive) and falls to `suppress` once its realityWeight has decayed. Don't present a stale observation as current fact; re-verify.
 
 ### When a path is blocked
 

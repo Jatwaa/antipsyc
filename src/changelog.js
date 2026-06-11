@@ -297,6 +297,20 @@ export const changelog = [
       { category: "feature", description: "New MCP tools force_validation / resolve_forced_gate / list_forced_gates / get_forced_gate and HTTP routes POST /api/conscience/force-validation, POST /api/conscience/resolve-gate, GET /api/conscience/gates. Orientation gains a confirmations workflow." },
       { category: "fix", description: "extractFilePaths matched a partial extension (\".js\" inside \".json\", \".c\" inside \".cpp\"), so confirmations and pause_and_verify / plan_verification mis-extracted paths like package.json as package.js. Extensions must now be complete." }
     ]
+  },
+  {
+    version: "0.9.0",
+    label: "v9",
+    released: "2026-06-11",
+    summary: "Response-level auditing, stronger validators, and the stale-evidence gate fix",
+    changes: [
+      { category: "fix", description: "STALE-EVIDENCE GATE FIX: decay is gradual, so a record one minute past its TTL still carried rw ≈ 0.96 and gated as 'verified' for hours after expiry — the gate never consulted the stale status. computeGate is now status-aware: stale evidence caps at 'caveat' (with a re-verify directive) and falls to 'suppress' once decayed, and can never return 'verified'." },
+      { category: "feature", description: "audit_response (POST /api/audit): lint a whole draft before sending — extracts every checkable claim, verifies each with a real validator, and returns verdict OK or REVISE with the grounded / contradicted / unverified breakdown. The natural integration point: audit before you answer." },
+      { category: "feature", description: "extract_claims (POST /api/extract): deterministic, no-LLM extractor that turns free text into ready-to-run verify_claim payloads (files, file content, exported symbols, URLs, package version, arithmetic), sentence-scoped so each artifact stays paired with what is asserted about it." },
+      { category: "feature", description: "First-class expectAbsent on verify_claim: assert that a target is ABSENT (verified = absent), e.g. file.contains + expectAbsent to prove a dependency is NOT present. Previously only the no-dependency template had this." },
+      { category: "feature", description: "New grounded validators: http.json_path (assert a dot-path value in a JSON response body, not just status 200); file.hash (sha256/sha1/sha512/md5 content hash, optionally compared); symbol.exists (a symbol is DECLARED/exported, not merely present as a substring); glob.count (number of files matching a glob vs an expected count). Each has a full contract profile, TTL, and type enforcement." },
+      { category: "fix", description: "extractFilePaths now requires complete extensions everywhere, improving claim extraction for confirmations, pause_and_verify, plan_verification, and the new extract_claims/audit_response tools." }
+    ]
   }
 ];
 
